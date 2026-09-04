@@ -269,7 +269,8 @@ int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
 	return get_agent_mode_entry(agent)->get_addrs_func(agent, records, size);
 }
 
-int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr) {
+static int mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, juice_cb_mux_raw_t raw_cb, bool raw, void *user_ptr) {
+    if (local_port < 1 || local_port > 65535) return JUICE_ERR_INVALID;
 	conn_mode_entry_t *entry = &mode_entries[JUICE_CONCURRENCY_MODE_MUX];
 
 	if (!entry->mux_listen_func) {
@@ -303,7 +304,7 @@ int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_inco
 		return -1;
 	}
 
-	if (entry->mux_listen_func(registry, cb, user_ptr)) {
+	if (raw ? conn_mux_listen_raw(registry, raw_cb, user_ptr) : entry->mux_listen_func(registry, cb, user_ptr)) {
 		JLOG_DEBUG("juice_mux_listen failed to call mux_listen_func for %s:%d", bind_address, local_port);
 		release_registry(entry, registry);
 		mutex_unlock(&entry->mutex);
@@ -313,4 +314,26 @@ int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_inco
 	release_registry(entry, registry);
 	mutex_unlock(&entry->mutex);
 	return 0;
+}
+
+int juice_mux_listen(const char *address, int port, juice_cb_mux_incoming_t cb, void *user_ptr) {
+    return mux_listen(address, port, cb, NULL, false, user_ptr);
+}
+int juice_mux_listen_raw(const char *address, int port, juice_cb_mux_raw_t cb, void *user_ptr) {
+    return mux_listen(address, port, NULL, cb, true, user_ptr);
+}
+int juice_mux_get_stats(const char *address, int port, juice_mux_stats_t *stats) {
+    if (!stats || port < 1 || port > 65535) return JUICE_ERR_INVALID;
+    conn_mode_entry_t *entry = &mode_entries[JUICE_CONCURRENCY_MODE_MUX];
+    udp_socket_config_t config = {0};
+    config.bind_address = address;
+    config.port_begin = config.port_end = port;
+    mutex_lock(&entry->mutex);
+    conn_registry_t *registry = entry->get_registry_func(&config);
+    if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
+    mutex_lock(&registry->mutex);
+    conn_mux_get_stats(registry, stats);
+    mutex_unlock(&registry->mutex);
+    mutex_unlock(&entry->mutex);
+    return 0;
 }
