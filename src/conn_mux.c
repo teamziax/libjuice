@@ -19,7 +19,7 @@
 
 #define BUFFER_SIZE 4096
 #define INITIAL_MAP_SIZE 16
-#define MAX_REPLAYS 64
+#define MAX_REPLAYS 1024
 #define MAX_REPLAY_SIZE 2048
 
 typedef struct replay_packet {
@@ -782,7 +782,7 @@ int conn_mux_replay(conn_registry_t *registry, const addr_record_t *src,
     packet->size = size;
     memcpy(packet->data, data, size);
     // Caller holds registry->mutex: the awakened thread sees the complete queue.
-    if (conn_mux_interrupt_registry(registry) != 0) {
+    if (!impl->replay_head && conn_mux_interrupt_registry(registry) != 0) {
         free(packet);
         return JUICE_ERR_FAILED;
     }

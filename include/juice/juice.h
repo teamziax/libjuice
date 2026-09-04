@@ -160,7 +160,7 @@ JUICE_EXPORT int juice_mux_listen_raw(const char *bind_address, int local_port,
                                      juice_cb_mux_raw_t cb, void *user_ptr);
 JUICE_EXPORT int juice_mux_get_stats(const char *bind_address, int local_port,
                                     juice_mux_stats_t *stats);
-// Copy a deferred STUN request into a bounded queue (64 requests, 2048 bytes each).
+// Copy a deferred STUN request into a bounded queue (1024 requests, 2048 bytes each).
 // Processed on the mux thread through the current raw gate and normal ICE lookup.
 // Call after peer setup, outside callbacks. Listener removal discards queued data.
 JUICE_EXPORT int juice_mux_replay(const char *bind_address, int local_port,

@@ -91,7 +91,7 @@ int main(void) {
     // Hold the recursive registry lock to keep consumption paused deterministically.
     // No peer construction/destruction runs concurrently in this test.
     mutex_lock(&a->registry->mutex);
-    for (int i=0; i<64; ++i)
+    for (int i=0; i<1024; ++i)
         assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,sizeof(packet))==0);
     assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,sizeof(packet))==JUICE_ERR_NOT_AVAIL);
     // Removing the listener while a peer exists must never turn admission off.
