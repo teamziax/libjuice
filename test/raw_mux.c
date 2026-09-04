@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 /* Linux reproducible ingress-gate regression; no external STUN/TURN service. */
 #include <juice/juice.h>
+#include "agent.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -79,13 +80,31 @@ int main(void) {
     send_packet(fd, port);
     s=await_packet(port, 2);
     assert(s.agents==1 && s.mapped_tuples==0 && s.rejected==2);
-    // Removing the listener while a peer exists must never turn admission off.
-    assert(juice_mux_listen_raw("127.0.0.1",port,NULL,NULL)==0);
-    send_packet(fd, port);
+    // Deferred input must traverse the raw guard again, even for a known ufrag.
+    assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,sizeof(packet))==0);
     s=await_packet(port, 3);
     assert(s.agents==1 && s.mapped_tuples==0 && s.rejected==3);
-    assert(atomic_load(&observed)==2);
+    assert(atomic_load(&observed)==3);
+    assert(juice_mux_replay("127.0.0.1",port,"localhost",23456,packet,sizeof(packet))==JUICE_ERR_INVALID);
+    assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",0,packet,sizeof(packet))==JUICE_ERR_INVALID);
+    assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,2049)==JUICE_ERR_INVALID);
+    // Hold the recursive registry lock to keep consumption paused deterministically.
+    // No peer construction/destruction runs concurrently in this test.
+    mutex_lock(&a->registry->mutex);
+    for (int i=0; i<1024; ++i)
+        assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,sizeof(packet))==0);
+    assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,sizeof(packet))==JUICE_ERR_NOT_AVAIL);
+    // Removing the listener while a peer exists must never turn admission off.
+    // It must also discard all queued packets before the mux thread resumes.
+    assert(juice_mux_listen_raw("127.0.0.1",port,NULL,NULL)==0);
+    mutex_unlock(&a->registry->mutex);
+    assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,sizeof(packet))==JUICE_ERR_NOT_AVAIL);
+    send_packet(fd, port);
+    s=await_packet(port, 4);
+    assert(s.agents==1 && s.mapped_tuples==0 && s.rejected==4);
+    assert(atomic_load(&observed)==3);
     juice_destroy(a);
+    assert(juice_mux_replay("127.0.0.1",port,"127.0.0.1",23456,packet,sizeof(packet))==JUICE_ERR_NOT_AVAIL);
     close(fd);
     // Deterministic port release after the last agent/listener.
     fd=socket(AF_INET,SOCK_DGRAM,0); assert(fd>=0);
