@@ -35,6 +35,7 @@ typedef struct map_entry {
 typedef struct registry_impl {
 	int conn_mux_registries_index;
 	uint16_t port;
+    char bind_address[ADDR_MAX_NUMERICHOST_LEN];
 	thread_t thread;
 	socket_t sock;
 	mutex_t send_mutex;
@@ -43,6 +44,11 @@ typedef struct registry_impl {
 	int map_size;
 	int map_count;
 	juice_cb_mux_incoming_t cb_mux_incoming;
+    juice_cb_mux_raw_t cb_mux_raw;
+    void *mux_raw_user_ptr;
+    bool raw_required;
+    uint64_t raw_received;
+    uint64_t raw_rejected;
 	void *mux_incoming_user_ptr;
 } registry_impl_t;
 
@@ -65,7 +71,8 @@ conn_registry_t *conn_mux_get_registry(udp_socket_config_t *config) {
 		conn_registry_t *registry = conn_mux_registries[i];
 		registry_impl_t *impl = registry->impl;
 
-		if (impl->port >= config->port_begin && (config->port_end == 0 || impl->port <= config->port_end)) {
+		if (strcmp(impl->bind_address, config->bind_address ? config->bind_address : "") == 0 &&
+            impl->port >= config->port_begin && (config->port_end == 0 || impl->port <= config->port_end)) {
 			return registry;
 		}
 	}
@@ -227,13 +234,14 @@ static thread_return_t THREAD_CALL conn_mux_thread_entry(void *arg) {
 }
 
 int conn_mux_registry_init(conn_registry_t *registry, udp_socket_config_t *config) {
-	(void)config;
+    if (config->bind_address && strlen(config->bind_address) >= ADDR_MAX_NUMERICHOST_LEN) return -1;
 	registry_impl_t *registry_impl = calloc(1, sizeof(registry_impl_t));
 	if (!registry_impl) {
 		JLOG_FATAL("Memory allocation failed for connections registry impl");
 		return -1;
 	}
 
+    if (config->bind_address) strcpy(registry_impl->bind_address, config->bind_address);
 	registry_impl->map = calloc(INITIAL_MAP_SIZE, sizeof(map_entry_t));
 	if (!registry_impl->map) {
 		JLOG_FATAL("Memory allocation failed for map");
@@ -324,7 +332,7 @@ int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t 
 
 	int count = registry->agents_count;
 	registry_impl_t *impl = registry->impl;
-	if (impl->cb_mux_incoming)
+	if (impl->cb_mux_incoming || impl->cb_mux_raw)
 		++count;
 	mutex_unlock(&registry->mutex);
 	return count;
@@ -335,6 +343,18 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 	JLOG_VERBOSE("Looking up agent from address");
 
 	registry_impl_t *registry_impl = registry->impl;
+    if (registry_impl->raw_required) {
+        ++registry_impl->raw_received;
+        char host[ADDR_MAX_NUMERICHOST_LEN];
+        if (!registry_impl->cb_mux_raw ||
+            getnameinfo((const struct sockaddr *)&src->addr, src->len, host,
+                        sizeof(host), NULL, 0, NI_NUMERICHOST) ||
+            !registry_impl->cb_mux_raw(buf, len, host,
+                addr_get_port((struct sockaddr *)src), registry_impl->mux_raw_user_ptr)) {
+            ++registry_impl->raw_rejected;
+            return NULL;
+        }
+    }
 	map_entry_t *entry = find_map_entry(registry_impl, src, false);
 	juice_agent_t *agent = entry && entry->type == MAP_ENTRY_TYPE_FULL ? entry->agent : NULL;
 	if (agent) {
@@ -680,7 +700,7 @@ int conn_mux_listen(conn_registry_t *registry, juice_cb_mux_incoming_t cb, void 
 		return -1;
 	}
 
-	if (registry_impl->cb_mux_incoming) {
+	if (registry_impl->cb_mux_incoming || registry_impl->raw_required) {
 		JLOG_VERBOSE("conn_mux_listen Callback already registered\n");
 		return -1;
 	}
@@ -699,5 +719,24 @@ bool conn_mux_can_release_registry(conn_registry_t *registry) {
 		return true;
 	}
 
-	return registry_impl->cb_mux_incoming == NULL;
+	return registry_impl->cb_mux_incoming == NULL && registry_impl->cb_mux_raw == NULL;
+}
+
+int conn_mux_listen_raw(conn_registry_t *registry, juice_cb_mux_raw_t cb, void *user_ptr) {
+    registry_impl_t *impl = registry->impl;
+    if (!impl || (cb && (impl->cb_mux_incoming || impl->cb_mux_raw))) return -1;
+    if (cb) impl->raw_required = true;
+    impl->cb_mux_raw = cb;
+    impl->mux_raw_user_ptr = cb ? user_ptr : NULL;
+    return conn_mux_interrupt_registry(registry);
+}
+
+void conn_mux_get_stats(conn_registry_t *registry, juice_mux_stats_t *stats) {
+    registry_impl_t *impl = registry->impl;
+    stats->received = impl->raw_received;
+    stats->rejected = impl->raw_rejected;
+    stats->agents = registry->agents_count;
+    stats->mapped_tuples = 0;
+    for (int i = 0; i < impl->map_size; ++i)
+        if (impl->map[i].type == MAP_ENTRY_TYPE_FULL) ++stats->mapped_tuples;
 }
