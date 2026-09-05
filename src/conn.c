@@ -338,3 +338,29 @@ int juice_mux_get_stats(const char *address, int port, juice_mux_stats_t *stats)
     mutex_unlock(&entry->mutex);
     return 0;
 }
+
+int juice_mux_replay(const char *address, int port, const char *source_address,
+                     int source_port, const void *data, size_t size) {
+    if (!data || size < 20 || size > 2048 || port < 1 || port > 65535 ||
+        source_port < 1 || source_port > 65535 || !source_address ||
+        !addr_is_numeric_hostname(source_address)) return JUICE_ERR_INVALID;
+    const unsigned char *bytes = data;
+    if (bytes[0] != 0 || bytes[1] != 1) return JUICE_ERR_INVALID;
+    addr_record_t src;
+    if (addr_resolve(source_address, NULL, SOCK_DGRAM, &src, 1) != 1)
+        return JUICE_ERR_INVALID;
+    addr_set_port((struct sockaddr *)&src.addr, (uint16_t)source_port);
+    addr_unmap_inet6_v4mapped((struct sockaddr *)&src.addr, &src.len);
+    conn_mode_entry_t *entry = &mode_entries[JUICE_CONCURRENCY_MODE_MUX];
+    udp_socket_config_t config = {0};
+    config.bind_address = address;
+    config.port_begin = config.port_end = port;
+    mutex_lock(&entry->mutex);
+    conn_registry_t *registry = entry->get_registry_func(&config);
+    if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
+    mutex_lock(&registry->mutex);
+    int ret = conn_mux_replay(registry, &src, data, size);
+    mutex_unlock(&registry->mutex);
+    mutex_unlock(&entry->mutex);
+    return ret;
+}

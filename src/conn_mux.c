@@ -19,6 +19,15 @@
 
 #define BUFFER_SIZE 4096
 #define INITIAL_MAP_SIZE 16
+#define MAX_REPLAYS 1024
+#define MAX_REPLAY_SIZE 2048
+
+typedef struct replay_packet {
+    struct replay_packet *next;
+    addr_record_t src;
+    size_t size;
+    char data[MAX_REPLAY_SIZE];
+} replay_packet_t;
 
 typedef enum map_entry_type {
 	MAP_ENTRY_TYPE_EMPTY = 0,
@@ -49,6 +58,8 @@ typedef struct registry_impl {
     bool raw_required;
     uint64_t raw_received;
     uint64_t raw_rejected;
+    replay_packet_t *replay_head, *replay_tail;
+    unsigned int replay_count;
 	void *mux_incoming_user_ptr;
 } registry_impl_t;
 
@@ -289,11 +300,22 @@ error:
 	return -1;
 }
 
+static void clear_replays(registry_impl_t *impl) {
+    while (impl->replay_head) {
+        replay_packet_t *packet = impl->replay_head;
+        impl->replay_head = packet->next;
+        free(packet);
+    }
+    impl->replay_tail = NULL;
+    impl->replay_count = 0;
+}
+
 void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	registry_impl_t *registry_impl = registry->impl;
 
 	JLOG_VERBOSE("Waiting for connections thread");
 	thread_join(registry_impl->thread, NULL);
+    clear_replays(registry_impl);
 
 	if (registry_impl->conn_mux_registries_index > -1) {
 		int i = registry_impl->conn_mux_registries_index;
@@ -439,6 +461,22 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 	return NULL;
 }
 
+static void process_datagram(conn_registry_t *registry, char *data, size_t size,
+                              const addr_record_t *src) {
+    juice_agent_t *agent = lookup_agent(registry, data, size, src);
+    if (!agent || !is_ready(agent)) {
+        JLOG_DEBUG("Agent not found for incoming datagram, dropping");
+        return;
+    }
+    conn_impl_t *conn_impl = agent->conn_impl;
+    if (agent_conn_recv(agent, data, size, src) != 0) {
+        JLOG_WARN("Agent receive failed");
+        conn_impl->finished = true;
+        return;
+    }
+    conn_impl->next_timestamp = current_timestamp();
+}
+
 int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 	mutex_lock(&registry->mutex);
 
@@ -448,6 +486,18 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 		mutex_unlock(&registry->mutex);
 		return -1;
 	}
+
+    registry_impl_t *impl = registry->impl;
+    // Re-enter authentication and tuple lookup on the ordinary mux thread.
+    // No application callback or native ICE work runs on the enqueueing thread.
+    while (impl->replay_head) {
+        replay_packet_t *packet = impl->replay_head;
+        impl->replay_head = packet->next;
+        if (!impl->replay_head) impl->replay_tail = NULL;
+        --impl->replay_count;
+        process_datagram(registry, packet->data, packet->size, &packet->src);
+        free(packet);
+    }
 
 	if (pfd->revents & POLLIN) {
 		char buffer[BUFFER_SIZE];
@@ -465,20 +515,7 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 				JLOG_DEBUG("Demultiplexing incoming datagram from %s", src_str);
 			}
 
-			juice_agent_t *agent = lookup_agent(registry, buffer, (size_t)ret, &src);
-			if (!agent || !is_ready(agent)) {
-				JLOG_DEBUG("Agent not found for incoming datagram, dropping");
-				continue;
-			}
-
-			conn_impl_t *conn_impl = agent->conn_impl;
-			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
-				JLOG_WARN("Agent receive failed");
-				conn_impl->finished = true;
-				continue;
-			}
-
-			conn_impl->next_timestamp = current_timestamp();
+            process_datagram(registry, buffer, (size_t)ret, &src);
 		}
 
 		if (ret < 0) {
@@ -728,7 +765,32 @@ int conn_mux_listen_raw(conn_registry_t *registry, juice_cb_mux_raw_t cb, void *
     if (cb) impl->raw_required = true;
     impl->cb_mux_raw = cb;
     impl->mux_raw_user_ptr = cb ? user_ptr : NULL;
+    if (!cb) clear_replays(impl);
     return conn_mux_interrupt_registry(registry);
+}
+
+int conn_mux_replay(conn_registry_t *registry, const addr_record_t *src,
+                    const void *data, size_t size) {
+    registry_impl_t *impl = registry->impl;
+    if (!impl->cb_mux_raw || impl->replay_count >= MAX_REPLAYS)
+        return JUICE_ERR_NOT_AVAIL;
+    if (size > MAX_REPLAY_SIZE) return JUICE_ERR_INVALID;
+    replay_packet_t *packet = malloc(sizeof(*packet));
+    if (!packet) return JUICE_ERR_FAILED;
+    packet->next = NULL;
+    packet->src = *src;
+    packet->size = size;
+    memcpy(packet->data, data, size);
+    // Caller holds registry->mutex: the awakened thread sees the complete queue.
+    if (!impl->replay_head && conn_mux_interrupt_registry(registry) != 0) {
+        free(packet);
+        return JUICE_ERR_FAILED;
+    }
+    if (impl->replay_tail) impl->replay_tail->next = packet;
+    else impl->replay_head = packet;
+    impl->replay_tail = packet;
+    ++impl->replay_count;
+    return JUICE_ERR_SUCCESS;
 }
 
 void conn_mux_get_stats(conn_registry_t *registry, juice_mux_stats_t *stats) {
@@ -736,7 +798,5 @@ void conn_mux_get_stats(conn_registry_t *registry, juice_mux_stats_t *stats) {
     stats->received = impl->raw_received;
     stats->rejected = impl->raw_rejected;
     stats->agents = registry->agents_count;
-    stats->mapped_tuples = 0;
-    for (int i = 0; i < impl->map_size; ++i)
-        if (impl->map[i].type == MAP_ENTRY_TYPE_FULL) ++stats->mapped_tuples;
+    stats->mapped_tuples = impl->map_count;
 }

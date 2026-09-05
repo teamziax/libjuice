@@ -80,16 +80,16 @@ typedef void (*juice_cb_mux_incoming_t)(const juice_mux_binding_request_t *info,
 /** Raw ingress gate, before parsing, tuple lookup, or flow promotion.
  * Data/address are borrowed for the callback only. The callback runs under the
  * mux lock: do not call juice APIs, block, or create/destroy agents here. Queue
- * bounded work and return false until it is safe to route a retransmission.
+ * bounded work and return false until it is safe to route a replay/retransmission.
  * Returning true permits normal demultiplexing; it does not bypass ICE checks.
  */
 typedef bool (*juice_cb_mux_raw_t)(const void *data, size_t size,
                                   const char *address, uint16_t port, void *user_ptr);
 typedef struct juice_mux_stats {
-    uint64_t received;
-    uint64_t rejected;
-    int agents;
-    int mapped_tuples;
+	uint64_t received; // Raw-gated datagrams, including replays
+	uint64_t rejected; // Datagrams rejected by the raw gate
+	int agents;        // Currently registered agents
+	int mapped_tuples; // Currently promoted source tuples
 } juice_mux_stats_t;
 
 
@@ -155,11 +155,18 @@ JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
 JUICE_EXPORT int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr);
 // One exclusive raw or parsed listener per endpoint. Stop with cb=NULL using
 // the same address/port. Removal waits for callbacks; existing agents remain
-// fail-closed until the registry is destroyed. Close agents before the listener.
+// fail-closed until another raw listener is installed or the registry is destroyed.
+// Close agents before the listener in normal shutdown.
 JUICE_EXPORT int juice_mux_listen_raw(const char *bind_address, int local_port,
                                      juice_cb_mux_raw_t cb, void *user_ptr);
 JUICE_EXPORT int juice_mux_get_stats(const char *bind_address, int local_port,
                                     juice_mux_stats_t *stats);
+// Copy a deferred STUN request into a bounded queue (1024 requests, 2048 bytes each).
+// Processed on the mux thread through the current raw gate and normal ICE lookup.
+// Call after peer setup, outside callbacks. Listener removal discards queued data.
+JUICE_EXPORT int juice_mux_replay(const char *bind_address, int local_port,
+                                 const char *source_address, int source_port,
+                                 const void *data, size_t size);
 
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
 
