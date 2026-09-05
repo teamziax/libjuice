@@ -30,6 +30,8 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
                         int ds);
 int conn_mux_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
 int conn_mux_listen(conn_registry_t *registry, juice_cb_mux_incoming_t cb, void *user_ptr);
+int conn_mux_listen_raw(conn_registry_t *registry, juice_cb_mux_raw_t cb, void *user_ptr);
+void conn_mux_get_stats(conn_registry_t *registry, juice_mux_stats_t *stats);
 conn_registry_t *conn_mux_get_registry(udp_socket_config_t *config);
 bool conn_mux_can_release_registry(conn_registry_t *registry);
 

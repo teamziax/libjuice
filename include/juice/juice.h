@@ -77,6 +77,22 @@ typedef struct juice_mux_binding_request {
 
 typedef void (*juice_cb_mux_incoming_t)(const juice_mux_binding_request_t *info, void *user_ptr);
 
+/** Raw ingress gate, before parsing, tuple lookup, or flow promotion.
+ * Data/address are borrowed for the callback only. The callback runs under the
+ * mux lock: do not call juice APIs, block, or create/destroy agents here. Queue
+ * bounded work and return false until it is safe to route a retransmission.
+ * Returning true permits normal demultiplexing; it does not bypass ICE checks.
+ */
+typedef bool (*juice_cb_mux_raw_t)(const void *data, size_t size,
+                                  const char *address, uint16_t port, void *user_ptr);
+typedef struct juice_mux_stats {
+    uint64_t received;
+    uint64_t rejected;
+    int agents;
+    int mapped_tuples;
+} juice_mux_stats_t;
+
+
 typedef struct juice_turn_server {
 	const char *host;
 	const char *username;
@@ -137,6 +153,14 @@ JUICE_EXPORT int juice_get_selected_addresses(juice_agent_t *agent, char *local,
 JUICE_EXPORT int juice_set_local_ice_attributes(juice_agent_t *agent, const char *ufrag, const char *pwd);
 JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
 JUICE_EXPORT int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr);
+// One exclusive raw or parsed listener per endpoint. Stop with cb=NULL using
+// the same address/port. Removal waits for callbacks; existing agents remain
+// fail-closed until the registry is destroyed. Close agents before the listener.
+JUICE_EXPORT int juice_mux_listen_raw(const char *bind_address, int local_port,
+                                     juice_cb_mux_raw_t cb, void *user_ptr);
+JUICE_EXPORT int juice_mux_get_stats(const char *bind_address, int local_port,
+                                    juice_mux_stats_t *stats);
+
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
 
 // ICE server
