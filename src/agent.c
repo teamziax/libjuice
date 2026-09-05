@@ -625,8 +625,8 @@ int agent_set_local_ice_attributes(juice_agent_t *agent, const char *ufrag, cons
 		return JUICE_ERR_FAILED;
 	}
 
-	if (strlen(ufrag) < 4 || strlen(pwd) < 22 || !ice_is_valid_string(ufrag) ||
-	    !ice_is_valid_string(pwd)) {
+	if (strlen(ufrag) < 4 || strlen(ufrag) > 256 || strlen(pwd) < 22 || strlen(pwd) > 256 ||
+	    !ice_is_valid_string(ufrag) || !ice_is_valid_string(pwd)) {
 		JLOG_ERROR("Invalid ICE attributes");
 		return JUICE_ERR_INVALID;
 	}
