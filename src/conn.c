@@ -270,97 +270,112 @@ int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
 	return get_agent_mode_entry(agent)->get_addrs_func(agent, records, size);
 }
 
-static int mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, juice_cb_mux_raw_t raw_cb, bool raw, void *user_ptr) {
-    if (local_port < 1 || local_port > 65535) return JUICE_ERR_INVALID;
-	conn_mode_entry_t *entry = &mode_entries[JUICE_CONCURRENCY_MODE_MUX];
-
-	if (!entry->mux_listen_func) {
-		JLOG_DEBUG("juice_mux_listen mux_listen_func is not implemented");
-		return -1;
-	}
-
-	if (!entry->get_registry_func) {
-		JLOG_DEBUG("juice_mux_listen get_registry_func is not implemented");
-		return -1;
-	}
-
+int juice_mux_listen(const char *address, int port, juice_cb_mux_incoming_t cb,
+                     void *user_ptr) {
+	if (port < 1 || port > 65535) return JUICE_ERR_INVALID;
+	conn_mode_entry_t *entry = get_mode_entry(JUICE_CONCURRENCY_MODE_MUX);
+	udp_socket_config_t config = {0};
+	config.bind_address = address;
+	config.port_begin = config.port_end = port;
 	mutex_lock(&entry->mutex);
-
-	udp_socket_config_t config;
-	config.bind_address = bind_address;
-	config.port_begin = config.port_end = local_port;
-
 	conn_registry_t *registry;
-
-	// locks the registry, creating it first if required
-	if(acquire_registry(entry, &config, &registry)) {
-		JLOG_DEBUG("juice_mux_listen acquiring registry failed");
+	if (acquire_registry(entry, &config, &registry)) {
 		mutex_unlock(&entry->mutex);
-		return -1;
+		return JUICE_ERR_FAILED;
 	}
+	int result = conn_mux_listen(registry, cb, user_ptr);
+	release_registry(entry, registry);
+	mutex_unlock(&entry->mutex);
+	return result;
+}
 
-	if (!registry) {
-		JLOG_DEBUG("juice_mux_listen registry not found after creating it");
-		mutex_unlock(&entry->mutex);
-		return -1;
-	}
-
-	if (raw ? conn_mux_listen_raw(registry, raw_cb, user_ptr) : entry->mux_listen_func(registry, cb, user_ptr)) {
-		JLOG_DEBUG("juice_mux_listen failed to call mux_listen_func for %s:%d", bind_address, local_port);
+int juice_mux_listen_pending(const char *address, int port,
+                            const juice_mux_pending_config_t *pending_config,
+                            juice_cb_mux_pending_t cb, void *user_ptr) {
+	if (port < 1 || port > 65535 || (pending_config &&
+	    (pending_config->max_pending > 4096 || pending_config->timeout_ms > 30000)))
+		return JUICE_ERR_INVALID;
+	conn_mode_entry_t *entry = get_mode_entry(JUICE_CONCURRENCY_MODE_MUX);
+	udp_socket_config_t config = {0};
+	config.bind_address = address;
+	config.port_begin = config.port_end = port;
+	mutex_lock(&entry->mutex);
+	conn_registry_t *registry;
+	int result;
+	if (cb) {
+		if (acquire_registry(entry, &config, &registry)) {
+			mutex_unlock(&entry->mutex);
+			return JUICE_ERR_FAILED;
+		}
+		result = conn_mux_listen_pending(registry, pending_config, cb, user_ptr);
 		release_registry(entry, registry);
 		mutex_unlock(&entry->mutex);
-		return -1;
+		return result;
 	}
-
+	registry = entry->get_registry_func(&config);
+	if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
+	mutex_lock(&registry->mutex);
+	result = conn_mux_begin_stop_pending(registry);
+	mutex_unlock(&registry->mutex);
+	mutex_unlock(&entry->mutex);
+	if (result != 0) return result;
+	// The closing listener pins the registry. Allow an in-flight callback to
+	// finish request operations that need the global entry lock before waiting.
+	conn_mux_wait_pending_callbacks(registry);
+	mutex_lock(&entry->mutex);
+	mutex_lock(&registry->mutex);
+	conn_mux_finish_stop_pending(registry);
 	release_registry(entry, registry);
 	mutex_unlock(&entry->mutex);
 	return 0;
 }
 
-int juice_mux_listen(const char *address, int port, juice_cb_mux_incoming_t cb, void *user_ptr) {
-    return mux_listen(address, port, cb, NULL, false, user_ptr);
-}
-int juice_mux_listen_raw(const char *address, int port, juice_cb_mux_raw_t cb, void *user_ptr) {
-    return mux_listen(address, port, NULL, cb, true, user_ptr);
-}
-int juice_mux_get_stats(const char *address, int port, juice_mux_stats_t *stats) {
-    if (!stats || port < 1 || port > 65535) return JUICE_ERR_INVALID;
-    conn_mode_entry_t *entry = &mode_entries[JUICE_CONCURRENCY_MODE_MUX];
-    udp_socket_config_t config = {0};
-    config.bind_address = address;
-    config.port_begin = config.port_end = port;
-    mutex_lock(&entry->mutex);
-    conn_registry_t *registry = entry->get_registry_func(&config);
-    if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
-    mutex_lock(&registry->mutex);
-    conn_mux_get_stats(registry, stats);
-    mutex_unlock(&registry->mutex);
-    mutex_unlock(&entry->mutex);
-    return 0;
+static int mux_request_operation(const char *address, int port, uint64_t id,
+                                 const char *password, juice_agent_t *agent, int operation) {
+	if (!id || port < 1 || port > 65535) return JUICE_ERR_INVALID;
+	conn_mode_entry_t *entry = get_mode_entry(JUICE_CONCURRENCY_MODE_MUX);
+	udp_socket_config_t config = {0};
+	config.bind_address = address;
+	config.port_begin = config.port_end = port;
+	mutex_lock(&entry->mutex);
+	conn_registry_t *registry = entry->get_registry_func(&config);
+	if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
+	mutex_lock(&registry->mutex);
+	int result;
+	if (operation == 0) result = conn_mux_verify_request(registry, id, password);
+	else if (operation == 1) result = conn_mux_attach_request(registry, id, agent);
+	else result = conn_mux_reject_request(registry, id);
+	mutex_unlock(&registry->mutex);
+	mutex_unlock(&entry->mutex);
+	return result;
 }
 
-int juice_mux_replay(const char *address, int port, const char *source_address,
-                     int source_port, const void *data, size_t size) {
-    if (!data || size < 20 || size > 2048 || port < 1 || port > 65535 ||
-        source_port < 1 || source_port > 65535 || !source_address ||
-        !addr_is_numeric_hostname(source_address)) return JUICE_ERR_INVALID;
-    const unsigned char *bytes = data;
-    if (bytes[0] != 0 || bytes[1] != 1) return JUICE_ERR_INVALID;
-    addr_record_t src;
-    if (addr_resolve(source_address, NULL, SOCK_DGRAM, &src, 1) != 1)
-        return JUICE_ERR_INVALID;
-    addr_set_port((struct sockaddr *)&src.addr, (uint16_t)source_port);
-    addr_unmap_inet6_v4mapped((struct sockaddr *)&src.addr, &src.len);
-    conn_mode_entry_t *entry = &mode_entries[JUICE_CONCURRENCY_MODE_MUX];
-    udp_socket_config_t config = {0};
-    config.bind_address = address;
-    config.port_begin = config.port_end = port;
-    mutex_lock(&entry->mutex);
-    conn_registry_t *registry = entry->get_registry_func(&config);
-    if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
-    mutex_lock(&registry->mutex);
-    int ret = conn_mux_replay(registry, &src, data, size);
-    mutex_unlock(&registry->mutex);
-    mutex_unlock(&entry->mutex);
-    return ret;
+int juice_mux_verify_request(const char *address, int port, uint64_t id, const char *password) {
+	if (!password || strlen(password) < 22 || strlen(password) > 256) return JUICE_ERR_INVALID;
+	return mux_request_operation(address, port, id, password, NULL, 0);
+}
+
+int juice_mux_attach_request(const char *address, int port, uint64_t id, juice_agent_t *agent) {
+	if (!agent) return JUICE_ERR_INVALID;
+	return mux_request_operation(address, port, id, NULL, agent, 1);
+}
+
+int juice_mux_reject_request(const char *address, int port, uint64_t id) {
+	return mux_request_operation(address, port, id, NULL, NULL, 2);
+}
+
+int juice_mux_get_stats(const char *address, int port, juice_mux_stats_t *stats) {
+	if (!stats || port < 1 || port > 65535) return JUICE_ERR_INVALID;
+	conn_mode_entry_t *entry = get_mode_entry(JUICE_CONCURRENCY_MODE_MUX);
+	udp_socket_config_t config = {0};
+	config.bind_address = address;
+	config.port_begin = config.port_end = port;
+	mutex_lock(&entry->mutex);
+	conn_registry_t *registry = entry->get_registry_func(&config);
+	if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
+	mutex_lock(&registry->mutex);
+	conn_mux_get_stats(registry, stats);
+	mutex_unlock(&registry->mutex);
+	mutex_unlock(&entry->mutex);
+	return 0;
 }

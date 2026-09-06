@@ -1306,7 +1306,7 @@ int agent_verify_stun_binding(juice_agent_t *agent, void *buf, size_t size,
 		return -1;
 	}
 	if (!stun_check_integrity(buf, size, msg, password)) {
-		JLOG_WARN("STUN integrity check failed, password=\"%s\"", password);
+		JLOG_DEBUG("STUN integrity check failed");
 		return -1;
 	}
 	return 0;
