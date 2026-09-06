@@ -39,8 +39,8 @@ make progress. The callback must still return promptly.
 
 Stop by calling `juice_mux_listen_pending` with a null callback and the original
 bind address and port. Stop cancels unaccepted requests and waits for active metadata
-callbacks to return. The callback context can then be freed. Accepted agents continue running, including processing their retained first
-request; new sources remain blocked. Stopping from inside the listener's
+callbacks to return. The callback context can then be freed. Accepted agents
+continue running, including processing their retained first request; new sources remain blocked. Stopping from inside the listener's
 own callback returns an error. Late decisions cannot apply to a replacement
 listener because request IDs are never reused. Keep the callback's owner alive
 until stop returns, and coordinate concurrent stop calls in that owner.
