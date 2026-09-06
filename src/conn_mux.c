@@ -21,6 +21,7 @@
 #define INITIAL_MAP_SIZE 16
 #define MAX_PENDING_PACKET_SIZE 2048
 #define MAX_NOTIFICATIONS_PER_TICK 64
+#define ICE_CHARACTERS "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 typedef struct pending_request {
 	struct pending_request *next;
@@ -556,7 +557,9 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 		const char *local_ufrag = username;
 		const char *remote_ufrag = separator + 1;
 		if (strlen(local_ufrag) < 4 || strlen(local_ufrag) > 256 ||
-		    strlen(remote_ufrag) < 4 || strlen(remote_ufrag) > 256 || strchr(remote_ufrag, ':')) {
+		    strlen(remote_ufrag) < 4 || strlen(remote_ufrag) > 256 ||
+		    strspn(local_ufrag, ICE_CHARACTERS) != strlen(local_ufrag) ||
+		    strspn(remote_ufrag, ICE_CHARACTERS) != strlen(remote_ufrag)) {
 			++registry_impl->rejected;
 			return NULL;
 		}
