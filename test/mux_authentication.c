@@ -9,13 +9,13 @@ static void incoming(const juice_mux_pending_request_t *request, void *ptr) {
 	atomic_fetch_add(&count, 1);
 }
 
-static uint64_t backlog_ids[64];
+static atomic_uint_fast64_t backlog_ids[64];
 static atomic_uint backlog_count;
 static void backlog(const juice_mux_pending_request_t *request, void *ptr) {
 	(void)ptr;
 	unsigned int index = atomic_load(&backlog_count);
 	assert(index < 64);
-	backlog_ids[index] = request->request_id;
+	atomic_store(&backlog_ids[index], request->request_id);
 	atomic_store(&backlog_count, index + 1);
 }
 static void reordered_cancellation(void) {
@@ -27,7 +27,7 @@ static void reordered_cancellation(void) {
 		if (i == 32) {
 			// Free the queue in reverse order, including non-head expiry/notification entries.
 			for (int j = 31; j >= 0; --j)
-				assert(juice_mux_reject_request("127.0.0.1", port, backlog_ids[j]) == 0);
+				assert(juice_mux_reject_request("127.0.0.1", port, atomic_load(&backlog_ids[j])) == 0);
 		}
 		char remote[24];
 		snprintf(remote, sizeof(remote), "peer%u", i);
@@ -36,8 +36,8 @@ static void reordered_cancellation(void) {
 		assert(atomic_load(&backlog_count) == i + 1);
 	}
 	for (int i = 63; i >= 32; --i) {
-		assert(juice_mux_verify_request("127.0.0.1", port, backlog_ids[i], test_password) == 0);
-		assert(juice_mux_reject_request("127.0.0.1", port, backlog_ids[i]) == 0);
+		assert(juice_mux_verify_request("127.0.0.1", port, atomic_load(&backlog_ids[i]), test_password) == 0);
+		assert(juice_mux_reject_request("127.0.0.1", port, atomic_load(&backlog_ids[i])) == 0);
 	}
 	juice_mux_stats_t stats;
 	assert(juice_mux_get_stats("127.0.0.1", port, &stats) == 0 && stats.pending == 0);
