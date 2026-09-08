@@ -33,8 +33,9 @@ application decision, even if they present a known username fragment.
 
 The default limit is 256 pending requests with a five-second timeout. Configuration
 allows at most 4096 requests and 30 seconds. Each request retains at most 2048
-packet bytes. Duplicate lookup uses a bounded hash table. At most 64 notifications
-are delivered per receive-loop iteration so timers and established agents also
+packet bytes. Duplicate and request-ID lookup use bounded hash tables. Separate
+expiry, notification and ready queues avoid scanning the backlog on each receive
+iteration. At most 64 notifications are delivered per receive-loop iteration so timers and established agents also
 make progress. The callback must still return promptly.
 
 Stop by calling `juice_mux_listen_pending` with a null callback and the original
@@ -63,3 +64,14 @@ The tests cover a first request sent once, delayed acceptance, duplicate handlin
 integrity failure before agent creation, verification before legacy address
 mapping, request limits, expiry, listener replacement and cancellation while a
 callback is active. They use local UDP sockets and no external signalling service.
+
+The low-level verify/attach pair also accepts another authenticated source tuple
+for an existing agent with matching credentials. A failed verification or attachment
+must not cause the application to destroy an existing caller-owned agent.
+
+For queue-maintenance measurements, build `mux-pending-bench` explicitly in a
+Release build with `PENDING_MUX_TESTS=ON`. This synthetic driver excludes polling,
+packet reception and application work; it is not a throughput benchmark.
+See the [measurement procedure and results](pending-performance.md).
+
+Detailed [contributor and source attribution](contribution-provenance.md) is retained separately.

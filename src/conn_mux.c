@@ -27,6 +27,9 @@ typedef struct pending_request {
 	struct pending_request *next;
 	struct pending_request *previous;
 	struct pending_request *hash_next;
+	struct pending_request *id_next;
+	struct pending_request *expiry_next, *expiry_previous;
+	struct pending_request *work_next, *work_previous;
 	uint64_t id;
 	timestamp_t deadline;
 	addr_record_t src;
@@ -77,8 +80,12 @@ typedef struct registry_impl {
 	unsigned int pending_count;
 	unsigned int pending_bucket_count;
 	pending_request_t **pending_buckets;
+	pending_request_t **pending_ids;
 	pending_request_t *pending_head;
 	pending_request_t *pending_tail;
+	pending_request_t *expiry_head, *expiry_tail;
+	pending_request_t *notify_head, *notify_tail;
+	pending_request_t *ready_head, *ready_tail;
 	uint64_t received;
 	uint64_t rejected;
 	uint64_t notifications;
@@ -336,12 +343,45 @@ static unsigned long pending_hash(const addr_record_t *src, const char *local,
 	return hash;
 }
 
+static void remove_expiry(registry_impl_t *impl, pending_request_t *request) {
+	if (request->expiry_previous) request->expiry_previous->expiry_next = request->expiry_next;
+	else impl->expiry_head = request->expiry_next;
+	if (request->expiry_next) request->expiry_next->expiry_previous = request->expiry_previous;
+	else impl->expiry_tail = request->expiry_previous;
+	request->expiry_next = request->expiry_previous = NULL;
+}
+
+static void remove_work(pending_request_t **head, pending_request_t **tail,
+                        pending_request_t *request) {
+	if (request->work_previous) request->work_previous->work_next = request->work_next;
+	else *head = request->work_next;
+	if (request->work_next) request->work_next->work_previous = request->work_previous;
+	else *tail = request->work_previous;
+	request->work_next = request->work_previous = NULL;
+}
+
+static void append_work(pending_request_t **head, pending_request_t **tail,
+                        pending_request_t *request) {
+	request->work_previous = *tail;
+	if (*tail) (*tail)->work_next = request;
+	else *head = request;
+	*tail = request;
+}
+
 static void remove_pending(registry_impl_t *impl, pending_request_t *request) {
 	unsigned long bucket = pending_hash(&request->src, request->local_ufrag,
 	                                   request->remote_ufrag) % impl->pending_bucket_count;
 	pending_request_t **link = &impl->pending_buckets[bucket];
 	while (*link != request) link = &(*link)->hash_next;
 	*link = request->hash_next;
+	link = &impl->pending_ids[request->id % impl->pending_bucket_count];
+	while (*link != request) link = &(*link)->id_next;
+	*link = request->id_next;
+	if (request->agent) remove_work(&impl->ready_head, &impl->ready_tail, request);
+	else {
+		remove_expiry(impl, request);
+		if (!request->notified) remove_work(&impl->notify_head, &impl->notify_tail, request);
+	}
 	if (request->previous) request->previous->next = request->next;
 	else impl->pending_head = request->next;
 	if (request->next) request->next->previous = request->previous;
@@ -357,19 +397,17 @@ static void clear_pending(registry_impl_t *impl) {
 }
 
 static void expire_pending(registry_impl_t *impl, timestamp_t now) {
-	pending_request_t *request = impl->pending_head;
-	while (request) {
-		pending_request_t *next = request->next;
-		if (!request->agent && request->deadline <= now) {
-			++impl->rejected;
-			remove_pending(impl, request);
-		}
-		request = next;
+	// All unaccepted requests use the same timeout and duplicates never extend it.
+	while (impl->expiry_head && impl->expiry_head->deadline <= now) {
+		++impl->rejected;
+		remove_pending(impl, impl->expiry_head);
 	}
 }
 
 static pending_request_t *pending_by_id(registry_impl_t *impl, uint64_t id) {
-	for (pending_request_t *request = impl->pending_head; request; request = request->next)
+	if (!impl->pending_ids) return NULL;
+	for (pending_request_t *request = impl->pending_ids[id % impl->pending_bucket_count];
+	     request; request = request->id_next)
 		if (request->id == id) return request;
 	return NULL;
 }
@@ -413,6 +451,13 @@ static void defer_request(registry_impl_t *impl, const addr_record_t *src,
 	if (impl->pending_tail) impl->pending_tail->next = request;
 	else impl->pending_head = request;
 	impl->pending_tail = request;
+	request->id_next = impl->pending_ids[request->id % impl->pending_bucket_count];
+	impl->pending_ids[request->id % impl->pending_bucket_count] = request;
+	request->expiry_previous = impl->expiry_tail;
+	if (impl->expiry_tail) impl->expiry_tail->expiry_next = request;
+	else impl->expiry_head = request;
+	impl->expiry_tail = request;
+	append_work(&impl->notify_head, &impl->notify_tail, request);
 	++impl->pending_count;
 }
 
@@ -424,8 +469,7 @@ static void dispatch_pending(conn_registry_t *registry) {
 		mutex_lock(&impl->callback_mutex);
 		mutex_lock(&registry->mutex);
 		expire_pending(impl, current_timestamp());
-		pending_request_t *request = impl->pending_head;
-		while (request && request->notified) request = request->next;
+		pending_request_t *request = impl->notify_head;
 		juice_cb_mux_pending_t cb = impl->cb_mux_pending;
 		if (!cb || !request) {
 			mutex_unlock(&registry->mutex);
@@ -446,6 +490,7 @@ static void dispatch_pending(conn_registry_t *registry) {
 		juice_mux_pending_request_t info = {request->id,
 			{local, remote, host, addr_get_port((const struct sockaddr *)&request->src.addr)}};
 		void *user_ptr = impl->mux_pending_user_ptr;
+		remove_work(&impl->notify_head, &impl->notify_tail, request);
 		request->notified = true;
 		++impl->notifications;
 		mutex_unlock(&registry->mutex);
@@ -461,6 +506,7 @@ void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	thread_join(registry_impl->thread, NULL);
 	clear_pending(registry_impl);
 	free(registry_impl->pending_buckets);
+	free(registry_impl->pending_ids);
 
 	if (registry_impl->conn_mux_registries_index > -1) {
 		int i = registry_impl->conn_mux_registries_index;
@@ -507,10 +553,9 @@ int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t 
 	registry_impl_t *impl = registry->impl;
 	if (impl->cb_mux_incoming || impl->cb_mux_pending || impl->pending_closing)
 		++count;
-	for (pending_request_t *request = impl->pending_head; request; request = request->next) {
-		timestamp_t deadline = (!request->notified || request->agent) ? now : request->deadline;
-		if (*next_timestamp > deadline) *next_timestamp = deadline;
-	}
+	if (impl->notify_head || impl->ready_head) *next_timestamp = now;
+	else if (impl->expiry_head && *next_timestamp > impl->expiry_head->deadline)
+		*next_timestamp = impl->expiry_head->deadline;
 	mutex_unlock(&registry->mutex);
 	return count;
 }
@@ -653,20 +698,16 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 
     registry_impl_t *impl = registry->impl;
 	expire_pending(impl, current_timestamp());
-	pending_request_t *request = impl->pending_head;
-	while (request) {
-		pending_request_t *next = request->next;
-		if (request->agent) {
-			juice_agent_t *agent = request->agent;
-			if (is_ready(agent) && insert_map_entry(impl, &request->src, agent) == 0) {
-				conn_impl_t *connection = agent->conn_impl;
-				if (agent_conn_recv(agent, request->data, request->size, &request->src) != 0)
-					connection->finished = true;
-				connection->next_timestamp = current_timestamp();
-			}
-			remove_pending(impl, request);
+	while (impl->ready_head) {
+		pending_request_t *request = impl->ready_head;
+		juice_agent_t *agent = request->agent;
+		if (is_ready(agent) && insert_map_entry(impl, &request->src, agent) == 0) {
+			conn_impl_t *connection = agent->conn_impl;
+			if (agent_conn_recv(agent, request->data, request->size, &request->src) != 0)
+				connection->finished = true;
+			connection->next_timestamp = current_timestamp();
 		}
-		request = next;
+		remove_pending(impl, request);
 	}
 
 	if (pfd->revents & POLLIN) {
@@ -949,9 +990,12 @@ int conn_mux_listen_pending(conn_registry_t *registry, const juice_mux_pending_c
 	unsigned int buckets = 1;
 	while (buckets < limit * 2) buckets *= 2;
 	pending_request_t **table = calloc(buckets, sizeof(*table));
-	if (!table) return JUICE_ERR_FAILED;
+	pending_request_t **ids = calloc(buckets, sizeof(*ids));
+	if (!table || !ids) { free(table); free(ids); return JUICE_ERR_FAILED; }
 	free(impl->pending_buckets);
+	free(impl->pending_ids);
 	impl->pending_buckets = table;
+	impl->pending_ids = ids;
 	impl->pending_bucket_count = buckets;
 	// Already-attached requests belong to their agents, even across listener stop.
 	for (pending_request_t *request = impl->pending_head; request; request = request->next) {
@@ -959,6 +1003,8 @@ int conn_mux_listen_pending(conn_registry_t *registry, const juice_mux_pending_c
 		                                   request->remote_ufrag) % buckets;
 		request->hash_next = table[bucket];
 		table[bucket] = request;
+		request->id_next = ids[request->id % buckets];
+		ids[request->id % buckets] = request;
 	}
 	impl->max_pending = limit;
 	impl->pending_timeout_ms = timeout;
@@ -1030,11 +1076,13 @@ int conn_mux_attach_request(conn_registry_t *registry, uint64_t id, juice_agent_
 	    strcmp(agent->local.ice_pwd, request->password) != 0) return JUICE_ERR_INVALID;
 	map_entry_t *entry = find_map_entry(impl, &request->src, false);
 	if (entry && entry->type == MAP_ENTRY_TYPE_FULL) return JUICE_ERR_NOT_AVAIL;
-	for (pending_request_t *other = impl->pending_head; other; other = other->next)
-		if (other->agent && addr_record_is_equal(&request->src, &other->src, true))
+	for (pending_request_t *other = impl->ready_head; other; other = other->work_next)
+		if (addr_record_is_equal(&request->src, &other->src, true))
 			return JUICE_ERR_NOT_AVAIL;
 	if (conn_mux_interrupt_registry(registry) != 0) return JUICE_ERR_FAILED;
+	remove_expiry(impl, request);
 	request->agent = agent;
+	append_work(&impl->ready_head, &impl->ready_tail, request);
 	return 0;
 }
 

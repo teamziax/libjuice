@@ -9,6 +9,42 @@ static void incoming(const juice_mux_pending_request_t *request, void *ptr) {
 	atomic_fetch_add(&count, 1);
 }
 
+static uint64_t backlog_ids[64];
+static atomic_uint backlog_count;
+static void backlog(const juice_mux_pending_request_t *request, void *ptr) {
+	(void)ptr;
+	unsigned int index = atomic_load(&backlog_count);
+	assert(index < 64);
+	backlog_ids[index] = request->request_id;
+	atomic_store(&backlog_count, index + 1);
+}
+static void reordered_cancellation(void) {
+	uint16_t port = test_port(), source;
+	int fd = test_socket(&source);
+	juice_mux_pending_config_t config = {32, 5000};
+	assert(juice_mux_listen_pending("127.0.0.1", port, &config, backlog, NULL) == 0);
+	for (unsigned int i = 0; i < 64; ++i) {
+		if (i == 32) {
+			// Free the queue in reverse order, including non-head expiry/notification entries.
+			for (int j = 31; j >= 0; --j)
+				assert(juice_mux_reject_request("127.0.0.1", port, backlog_ids[j]) == 0);
+		}
+		char remote[24];
+		snprintf(remote, sizeof(remote), "peer%u", i);
+		test_send(fd, port, "host", remote, test_password);
+		for (int j = 0; j < 400 && atomic_load(&backlog_count) <= i; ++j) usleep(1000);
+		assert(atomic_load(&backlog_count) == i + 1);
+	}
+	for (int i = 63; i >= 32; --i) {
+		assert(juice_mux_verify_request("127.0.0.1", port, backlog_ids[i], test_password) == 0);
+		assert(juice_mux_reject_request("127.0.0.1", port, backlog_ids[i]) == 0);
+	}
+	juice_mux_stats_t stats;
+	assert(juice_mux_get_stats("127.0.0.1", port, &stats) == 0 && stats.pending == 0);
+	assert(juice_mux_listen_pending("127.0.0.1", port, NULL, NULL, NULL) == 0);
+	close(fd);
+}
+
 int main(void) {
 	juice_set_log_level(JUICE_LOG_LEVEL_FATAL);
 	uint16_t port = test_port(), source;
@@ -59,5 +95,6 @@ int main(void) {
 	assert(juice_mux_reject_request("127.0.0.1", port, atomic_load(&last_id)) == 0);
 	assert(juice_mux_listen_pending("127.0.0.1", port, NULL, NULL, NULL) == 0);
 	close(fd);
+	reordered_cancellation();
 	puts("mux authentication: verify before mapping, bounded attempts, expiry, distinct endpoints, stale IDs PASS");
 }
