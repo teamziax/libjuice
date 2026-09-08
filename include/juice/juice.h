@@ -77,6 +77,36 @@ typedef struct juice_mux_binding_request {
 
 typedef void (*juice_cb_mux_incoming_t)(const juice_mux_binding_request_t *info, void *user_ptr);
 
+typedef struct juice_mux_pending_request {
+	uint64_t request_id;
+	juice_mux_binding_request_t binding;
+} juice_mux_pending_request_t;
+
+typedef struct juice_mux_pending_config {
+	unsigned int max_pending; // 0 selects 256; maximum 4096
+	unsigned int timeout_ms;  // 0 selects 5000; maximum 30000
+} juice_mux_pending_config_t;
+
+/** Called once for a pending attempt, outside the UDP registry lock.
+ * Metadata is borrowed until the callback returns. Copy it to defer a decision.
+ * Keep callbacks short: enqueue application work and return. Request operations
+ * may be called here, but stopping this listener from its callback is invalid.
+ * Packet bytes remain native. Duplicate requests do not repeat the callback.
+ */
+typedef void (*juice_cb_mux_pending_t)(const juice_mux_pending_request_t *request,
+	                                  void *user_ptr);
+
+typedef struct juice_mux_stats {
+	uint64_t received; // Datagrams received from the socket
+	uint64_t rejected;
+	int agents;        // Currently registered agents
+	int mapped_tuples; // Currently authenticated source tuples
+	unsigned int pending;
+	uint64_t notifications;
+	uint64_t duplicates;
+} juice_mux_stats_t;
+
+
 typedef struct juice_turn_server {
 	const char *host;
 	const char *username;
@@ -137,6 +167,29 @@ JUICE_EXPORT int juice_get_selected_addresses(juice_agent_t *agent, char *local,
 JUICE_EXPORT int juice_set_local_ice_attributes(juice_agent_t *agent, const char *ufrag, const char *pwd);
 JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
 JUICE_EXPORT int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr);
+/** One exclusive pending or legacy listener per endpoint. NULL config uses defaults.
+ * Stop with cb=NULL and the same address/port. Stop cancels unaccepted requests and
+ * waits for callbacks; attached agents retain their first packet and continue normally.
+ * Request IDs are process-unique and remain invalid after cancellation or stop.
+ */
+JUICE_EXPORT int juice_mux_listen_pending(const char *bind_address, int local_port,
+	const juice_mux_pending_config_t *config, juice_cb_mux_pending_t cb, void *user_ptr);
+/** Authenticate and claim the held request before constructing an agent.
+ * A failed integrity check discards the request. A second verification fails.
+ */
+JUICE_EXPORT int juice_mux_verify_request(const char *bind_address, int local_port,
+	uint64_t request_id, const char *local_pwd);
+/** Attach a configured, gathered mux agent and schedule the held first request.
+ * The agent must use this endpoint and match both username fragments and the
+ * verified password. Processing takes place on the mux thread, never inline.
+ */
+JUICE_EXPORT int juice_mux_attach_request(const char *bind_address, int local_port,
+	uint64_t request_id, juice_agent_t *agent);
+JUICE_EXPORT int juice_mux_reject_request(const char *bind_address, int local_port,
+	uint64_t request_id);
+JUICE_EXPORT int juice_mux_get_stats(const char *bind_address, int local_port,
+                                    juice_mux_stats_t *stats);
+
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
 
 // ICE server

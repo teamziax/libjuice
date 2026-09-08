@@ -35,10 +35,14 @@ static bool match_prefix(const char *str, const char *prefix, const char **end) 
 static int parse_sdp_line(const char *line, ice_description_t *description) {
 	const char *arg;
 	if (match_prefix(line, "a=ice-ufrag:", &arg)) {
+		if (strlen(arg) < 4 || strlen(arg) > 256 || !ice_is_valid_string(arg))
+			return ICE_PARSE_ERROR;
 		sscanf(arg, "%256s", description->ice_ufrag);
 		return 0;
 	}
 	if (match_prefix(line, "a=ice-pwd:", &arg)) {
+		if (strlen(arg) < 22 || strlen(arg) > 256 || !ice_is_valid_string(arg))
+			return ICE_PARSE_ERROR;
 		sscanf(arg, "%256s", description->ice_pwd);
 		return 0;
 	}

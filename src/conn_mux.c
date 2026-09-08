@@ -19,6 +19,32 @@
 
 #define BUFFER_SIZE 4096
 #define INITIAL_MAP_SIZE 16
+#define MAX_PENDING_PACKET_SIZE 2048
+#define MAX_NOTIFICATIONS_PER_TICK 64
+#define ICE_CHARACTERS "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+typedef struct pending_request {
+	struct pending_request *next;
+	struct pending_request *previous;
+	struct pending_request *hash_next;
+	struct pending_request *id_next;
+	struct pending_request *expiry_next, *expiry_previous;
+	struct pending_request *work_next, *work_previous;
+	uint64_t id;
+	timestamp_t deadline;
+	addr_record_t src;
+	char local_ufrag[257];
+	char remote_ufrag[257];
+	char password[257];
+	bool notified;
+	bool verified;
+	juice_agent_t *agent;
+	size_t size;
+	char data[MAX_PENDING_PACKET_SIZE];
+} pending_request_t;
+
+static mutex_t request_id_mutex = MUTEX_INITIALIZER;
+static uint64_t next_request_id = 1;
 
 typedef enum map_entry_type {
 	MAP_ENTRY_TYPE_EMPTY = 0,
@@ -35,6 +61,7 @@ typedef struct map_entry {
 typedef struct registry_impl {
 	int conn_mux_registries_index;
 	uint16_t port;
+	char bind_address[ADDR_MAX_NUMERICHOST_LEN];
 	thread_t thread;
 	socket_t sock;
 	mutex_t send_mutex;
@@ -43,6 +70,26 @@ typedef struct registry_impl {
 	int map_size;
 	int map_count;
 	juice_cb_mux_incoming_t cb_mux_incoming;
+	juice_cb_mux_pending_t cb_mux_pending;
+	void *mux_pending_user_ptr;
+	bool pending_required;
+	bool pending_closing;
+	mutex_t callback_mutex;
+	unsigned int max_pending;
+	unsigned int pending_timeout_ms;
+	unsigned int pending_count;
+	unsigned int pending_bucket_count;
+	pending_request_t **pending_buckets;
+	pending_request_t **pending_ids;
+	pending_request_t *pending_head;
+	pending_request_t *pending_tail;
+	pending_request_t *expiry_head, *expiry_tail;
+	pending_request_t *notify_head, *notify_tail;
+	pending_request_t *ready_head, *ready_tail;
+	uint64_t received;
+	uint64_t rejected;
+	uint64_t notifications;
+	uint64_t duplicates;
 	void *mux_incoming_user_ptr;
 } registry_impl_t;
 
@@ -65,7 +112,8 @@ conn_registry_t *conn_mux_get_registry(udp_socket_config_t *config) {
 		conn_registry_t *registry = conn_mux_registries[i];
 		registry_impl_t *impl = registry->impl;
 
-		if (impl->port >= config->port_begin && (config->port_end == 0 || impl->port <= config->port_end)) {
+		if (strcmp(impl->bind_address, config->bind_address ? config->bind_address : "") == 0 &&
+            impl->port >= config->port_begin && (config->port_end == 0 || impl->port <= config->port_end)) {
 			return registry;
 		}
 	}
@@ -152,7 +200,8 @@ static int insert_map_entry(registry_impl_t *impl, const addr_record_t *record,
 
 	map_entry_t *entry = find_map_entry(impl, record, true); // allow deleted
 	if (!entry || (entry->type != MAP_ENTRY_TYPE_FULL && impl->map_count * 2 >= impl->map_size)) {
-		grow_map(impl, impl->map_size * 2);
+		if (grow_map(impl, impl->map_size * 2) != 0)
+			return -1;
 		return insert_map_entry(impl, record, agent);
 	}
 
@@ -227,13 +276,14 @@ static thread_return_t THREAD_CALL conn_mux_thread_entry(void *arg) {
 }
 
 int conn_mux_registry_init(conn_registry_t *registry, udp_socket_config_t *config) {
-	(void)config;
+    if (config->bind_address && strlen(config->bind_address) >= ADDR_MAX_NUMERICHOST_LEN) return -1;
 	registry_impl_t *registry_impl = calloc(1, sizeof(registry_impl_t));
 	if (!registry_impl) {
 		JLOG_FATAL("Memory allocation failed for connections registry impl");
 		return -1;
 	}
 
+    if (config->bind_address) strcpy(registry_impl->bind_address, config->bind_address);
 	registry_impl->map = calloc(INITIAL_MAP_SIZE, sizeof(map_entry_t));
 	if (!registry_impl->map) {
 		JLOG_FATAL("Memory allocation failed for map");
@@ -254,25 +304,26 @@ int conn_mux_registry_init(conn_registry_t *registry, udp_socket_config_t *confi
 	registry_impl->port = udp_get_port(registry_impl->sock);
 
 	mutex_init(&registry_impl->send_mutex, 0);
+	mutex_init(&registry_impl->callback_mutex, 0);
 	registry->impl = registry_impl;
 
+	if (conn_mux_add_registry(registry)) {
+		JLOG_FATAL("Could not add registry");
+		goto error;
+	}
 	JLOG_DEBUG("Starting connections thread");
 	int ret = thread_init(&registry_impl->thread, conn_mux_thread_entry, registry);
 	if (ret) {
 		JLOG_FATAL("Thread creation failed, error=%d", ret);
+		conn_mux_registries[registry_impl->conn_mux_registries_index] = NULL;
+		--conn_mux_registries_count;
 		goto error;
-	}
-
-	if (conn_mux_add_registry(registry)) {
-		JLOG_FATAL("Could not add registry");
-		free(registry_impl->map);
-		free(registry_impl);
-		return -1;
 	}
 
 	return 0;
 
 error:
+	mutex_destroy(&registry_impl->callback_mutex);
 	mutex_destroy(&registry_impl->send_mutex);
 	closesocket(registry_impl->sock);
 	free(registry_impl->map);
@@ -281,11 +332,181 @@ error:
 	return -1;
 }
 
+static unsigned long pending_hash(const addr_record_t *src, const char *local,
+                                  const char *remote) {
+	unsigned long hash = addr_record_hash(src, true);
+	for (const unsigned char *p = (const unsigned char *)local; *p; ++p)
+		hash = hash * 33 + *p;
+	hash = hash * 33 + ':';
+	for (const unsigned char *p = (const unsigned char *)remote; *p; ++p)
+		hash = hash * 33 + *p;
+	return hash;
+}
+
+static void remove_expiry(registry_impl_t *impl, pending_request_t *request) {
+	if (request->expiry_previous) request->expiry_previous->expiry_next = request->expiry_next;
+	else impl->expiry_head = request->expiry_next;
+	if (request->expiry_next) request->expiry_next->expiry_previous = request->expiry_previous;
+	else impl->expiry_tail = request->expiry_previous;
+	request->expiry_next = request->expiry_previous = NULL;
+}
+
+static void remove_work(pending_request_t **head, pending_request_t **tail,
+                        pending_request_t *request) {
+	if (request->work_previous) request->work_previous->work_next = request->work_next;
+	else *head = request->work_next;
+	if (request->work_next) request->work_next->work_previous = request->work_previous;
+	else *tail = request->work_previous;
+	request->work_next = request->work_previous = NULL;
+}
+
+static void append_work(pending_request_t **head, pending_request_t **tail,
+                        pending_request_t *request) {
+	request->work_previous = *tail;
+	if (*tail) (*tail)->work_next = request;
+	else *head = request;
+	*tail = request;
+}
+
+static void remove_pending(registry_impl_t *impl, pending_request_t *request) {
+	unsigned long bucket = pending_hash(&request->src, request->local_ufrag,
+	                                   request->remote_ufrag) % impl->pending_bucket_count;
+	pending_request_t **link = &impl->pending_buckets[bucket];
+	while (*link != request) link = &(*link)->hash_next;
+	*link = request->hash_next;
+	link = &impl->pending_ids[request->id % impl->pending_bucket_count];
+	while (*link != request) link = &(*link)->id_next;
+	*link = request->id_next;
+	if (request->agent) remove_work(&impl->ready_head, &impl->ready_tail, request);
+	else {
+		remove_expiry(impl, request);
+		if (!request->notified) remove_work(&impl->notify_head, &impl->notify_tail, request);
+	}
+	if (request->previous) request->previous->next = request->next;
+	else impl->pending_head = request->next;
+	if (request->next) request->next->previous = request->previous;
+	else impl->pending_tail = request->previous;
+	--impl->pending_count;
+	memset(request->password, 0, sizeof(request->password));
+	memset(request->data, 0, request->size);
+	free(request);
+}
+
+static void clear_pending(registry_impl_t *impl) {
+	while (impl->pending_head) remove_pending(impl, impl->pending_head);
+}
+
+static void expire_pending(registry_impl_t *impl, timestamp_t now) {
+	// All unaccepted requests use the same timeout and duplicates never extend it.
+	while (impl->expiry_head && impl->expiry_head->deadline <= now) {
+		++impl->rejected;
+		remove_pending(impl, impl->expiry_head);
+	}
+}
+
+static pending_request_t *pending_by_id(registry_impl_t *impl, uint64_t id) {
+	if (!impl->pending_ids) return NULL;
+	for (pending_request_t *request = impl->pending_ids[id % impl->pending_bucket_count];
+	     request; request = request->id_next)
+		if (request->id == id) return request;
+	return NULL;
+}
+
+static void defer_request(registry_impl_t *impl, const addr_record_t *src,
+                          const char *local, const char *remote, const char *data, size_t size) {
+	if (!impl->cb_mux_pending || size > MAX_PENDING_PACKET_SIZE) {
+		++impl->rejected;
+		return;
+	}
+	unsigned long bucket = pending_hash(src, local, remote) % impl->pending_bucket_count;
+	for (pending_request_t *request = impl->pending_buckets[bucket]; request;
+	     request = request->hash_next) {
+		if (addr_record_is_equal(src, &request->src, true) &&
+		    strcmp(local, request->local_ufrag) == 0 &&
+		    strcmp(remote, request->remote_ufrag) == 0) {
+			++impl->duplicates;
+			return; // Duplicates neither replace the first packet nor extend its deadline.
+		}
+	}
+	if (impl->pending_count >= impl->max_pending) {
+		++impl->rejected;
+		return;
+	}
+	pending_request_t *request = calloc(1, sizeof(*request));
+	if (!request) { ++impl->rejected; return; }
+	mutex_lock(&request_id_mutex);
+	request->id = next_request_id;
+	if (next_request_id != 0) ++next_request_id;
+	mutex_unlock(&request_id_mutex);
+	if (!request->id) { free(request); ++impl->rejected; return; }
+	request->src = *src;
+	request->deadline = current_timestamp() + impl->pending_timeout_ms;
+	strcpy(request->local_ufrag, local);
+	strcpy(request->remote_ufrag, remote);
+	request->size = size;
+	memcpy(request->data, data, size);
+	request->hash_next = impl->pending_buckets[bucket];
+	impl->pending_buckets[bucket] = request;
+	request->previous = impl->pending_tail;
+	if (impl->pending_tail) impl->pending_tail->next = request;
+	else impl->pending_head = request;
+	impl->pending_tail = request;
+	request->id_next = impl->pending_ids[request->id % impl->pending_bucket_count];
+	impl->pending_ids[request->id % impl->pending_bucket_count] = request;
+	request->expiry_previous = impl->expiry_tail;
+	if (impl->expiry_tail) impl->expiry_tail->expiry_next = request;
+	else impl->expiry_head = request;
+	impl->expiry_tail = request;
+	append_work(&impl->notify_head, &impl->notify_tail, request);
+	++impl->pending_count;
+}
+
+// Callback serialization is separate from the registry lock. Stop first detaches
+// the callback, then waits here without holding the global registry-entry lock.
+static void dispatch_pending(conn_registry_t *registry) {
+	registry_impl_t *impl = registry->impl;
+	for (unsigned int i = 0; i < MAX_NOTIFICATIONS_PER_TICK; ++i) {
+		mutex_lock(&impl->callback_mutex);
+		mutex_lock(&registry->mutex);
+		expire_pending(impl, current_timestamp());
+		pending_request_t *request = impl->notify_head;
+		juice_cb_mux_pending_t cb = impl->cb_mux_pending;
+		if (!cb || !request) {
+			mutex_unlock(&registry->mutex);
+			mutex_unlock(&impl->callback_mutex);
+			break;
+		}
+		char local[257], remote[257], host[ADDR_MAX_NUMERICHOST_LEN];
+		if (getnameinfo((const struct sockaddr *)&request->src.addr, request->src.len,
+		                host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0) {
+			++impl->rejected;
+			remove_pending(impl, request);
+			mutex_unlock(&registry->mutex);
+			mutex_unlock(&impl->callback_mutex);
+			continue;
+		}
+		strcpy(local, request->local_ufrag);
+		strcpy(remote, request->remote_ufrag);
+		juice_mux_pending_request_t info = {request->id,
+			{local, remote, host, addr_get_port((const struct sockaddr *)&request->src.addr)}};
+		void *user_ptr = impl->mux_pending_user_ptr;
+		remove_work(&impl->notify_head, &impl->notify_tail, request);
+		request->notified = true;
+		++impl->notifications;
+		mutex_unlock(&registry->mutex);
+		cb(&info, user_ptr);
+		mutex_unlock(&impl->callback_mutex);
+	}
+}
+
 void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	registry_impl_t *registry_impl = registry->impl;
 
 	JLOG_VERBOSE("Waiting for connections thread");
 	thread_join(registry_impl->thread, NULL);
+	clear_pending(registry_impl);
+	free(registry_impl->pending_buckets);
+	free(registry_impl->pending_ids);
 
 	if (registry_impl->conn_mux_registries_index > -1) {
 		int i = registry_impl->conn_mux_registries_index;
@@ -296,7 +517,13 @@ void conn_mux_registry_cleanup(conn_registry_t *registry) {
 
 	assert(conn_mux_registries_count > 0);
 	--conn_mux_registries_count;
+	if (conn_mux_registries_count == 0) {
+		free(conn_mux_registries);
+		conn_mux_registries = NULL;
+		conn_mux_registries_size = 0;
+	}
 
+	mutex_destroy(&registry_impl->callback_mutex);
 	mutex_destroy(&registry_impl->send_mutex);
 	closesocket(registry_impl->sock);
 	free(registry_impl->map);
@@ -324,8 +551,11 @@ int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t 
 
 	int count = registry->agents_count;
 	registry_impl_t *impl = registry->impl;
-	if (impl->cb_mux_incoming)
+	if (impl->cb_mux_incoming || impl->cb_mux_pending || impl->pending_closing)
 		++count;
+	if (impl->notify_head || impl->ready_head) *next_timestamp = now;
+	else if (impl->expiry_head && *next_timestamp > impl->expiry_head->deadline)
+		*next_timestamp = impl->expiry_head->deadline;
 	mutex_unlock(&registry->mutex);
 	return count;
 }
@@ -343,7 +573,8 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 	}
 
 	if (!is_stun_datagram(buf, len)) {
-		JLOG_INFO("Got non-STUN message from unknown source address");
+		++registry_impl->rejected;
+		JLOG_DEBUG("Got non-STUN message from unknown source address");
 		return NULL;
 	}
 
@@ -351,7 +582,8 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 
 	stun_message_t msg;
 	if (stun_read(buf, len, &msg) < 0) {
-		JLOG_ERROR("STUN message reading failed");
+		++registry_impl->rejected;
+		JLOG_DEBUG("STUN message reading failed");
 		return NULL;
 	}
 
@@ -362,17 +594,35 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 		strcpy(username, msg.credentials.username);
 		char *separator = strchr(username, ':');
 		if (!separator) {
-			JLOG_WARN("STUN username invalid, username=\"%s\"", username);
+			++registry_impl->rejected;
+			JLOG_DEBUG("Invalid STUN username");
 			return NULL;
 		}
 		*separator = '\0';
 		const char *local_ufrag = username;
+		const char *remote_ufrag = separator + 1;
+		if (strlen(local_ufrag) < 4 || strlen(local_ufrag) > 256 ||
+		    strlen(remote_ufrag) < 4 || strlen(remote_ufrag) > 256 ||
+		    strspn(local_ufrag, ICE_CHARACTERS) != strlen(local_ufrag) ||
+		    strspn(remote_ufrag, ICE_CHARACTERS) != strlen(remote_ufrag)) {
+			++registry_impl->rejected;
+			return NULL;
+		}
+		if (registry_impl->pending_required) {
+			defer_request(registry_impl, src, local_ufrag, remote_ufrag, buf, len);
+			return NULL;
+		}
 		for (int i = 0; i < registry->agents_size; ++i) {
 			agent = registry->agents[i];
 			if (is_ready(agent)) {
 				if (strcmp(local_ufrag, agent->local.ice_ufrag) == 0) {
 					JLOG_DEBUG("Found agent from ICE ufrag");
-					insert_map_entry(registry_impl, src, agent);
+					// A username match alone must never authorize the source address.
+					if (agent_verify_stun_binding(agent, buf, len, &msg) != 0) {
+						++registry_impl->rejected;
+						return NULL;
+					}
+					if (insert_map_entry(registry_impl, src, agent) != 0) return NULL;
 					return agent;
 				}
 			}
@@ -401,7 +651,8 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 		}
 	} else {
 		if (!STUN_IS_RESPONSE(msg.msg_class)) {
-			JLOG_INFO("Got unexpected STUN message from unknown source address");
+			++registry_impl->rejected;
+			JLOG_DEBUG("Got unexpected STUN message from unknown source address");
 			return NULL;
 		}
 
@@ -419,6 +670,22 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 	return NULL;
 }
 
+static void process_datagram(conn_registry_t *registry, char *data, size_t size,
+                              const addr_record_t *src) {
+    juice_agent_t *agent = lookup_agent(registry, data, size, src);
+    if (!agent || !is_ready(agent)) {
+        JLOG_DEBUG("Agent not found for incoming datagram, dropping");
+        return;
+    }
+    conn_impl_t *conn_impl = agent->conn_impl;
+    if (agent_conn_recv(agent, data, size, src) != 0) {
+        JLOG_WARN("Agent receive failed");
+        conn_impl->finished = true;
+        return;
+    }
+    conn_impl->next_timestamp = current_timestamp();
+}
+
 int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 	mutex_lock(&registry->mutex);
 
@@ -427,6 +694,20 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 		conn_mux_fail(registry);
 		mutex_unlock(&registry->mutex);
 		return -1;
+	}
+
+    registry_impl_t *impl = registry->impl;
+	expire_pending(impl, current_timestamp());
+	while (impl->ready_head) {
+		pending_request_t *request = impl->ready_head;
+		juice_agent_t *agent = request->agent;
+		if (is_ready(agent) && insert_map_entry(impl, &request->src, agent) == 0) {
+			conn_impl_t *connection = agent->conn_impl;
+			if (agent_conn_recv(agent, request->data, request->size, &request->src) != 0)
+				connection->finished = true;
+			connection->next_timestamp = current_timestamp();
+		}
+		remove_pending(impl, request);
 	}
 
 	if (pfd->revents & POLLIN) {
@@ -445,20 +726,8 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 				JLOG_DEBUG("Demultiplexing incoming datagram from %s", src_str);
 			}
 
-			juice_agent_t *agent = lookup_agent(registry, buffer, (size_t)ret, &src);
-			if (!agent || !is_ready(agent)) {
-				JLOG_DEBUG("Agent not found for incoming datagram, dropping");
-				continue;
-			}
-
-			conn_impl_t *conn_impl = agent->conn_impl;
-			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
-				JLOG_WARN("Agent receive failed");
-				conn_impl->finished = true;
-				continue;
-			}
-
-			conn_impl->next_timestamp = current_timestamp();
+			++impl->received;
+			process_datagram(registry, buffer, (size_t)ret, &src);
 		}
 
 		if (ret < 0) {
@@ -483,6 +752,7 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 	}
 
 	mutex_unlock(&registry->mutex);
+	dispatch_pending(registry);
 	return 0;
 }
 
@@ -568,6 +838,12 @@ void conn_mux_cleanup(juice_agent_t *agent) {
 	mutex_lock(&registry->mutex);
 	registry_impl_t *registry_impl = registry->impl;
 	remove_map_entries(registry_impl, agent);
+	pending_request_t *request = registry_impl->pending_head;
+	while (request) {
+		pending_request_t *next = request->next;
+		if (request->agent == agent) remove_pending(registry_impl, request);
+		request = next;
+	}
 	mutex_unlock(&registry->mutex);
 
 	conn_mux_interrupt(agent);
@@ -680,7 +956,7 @@ int conn_mux_listen(conn_registry_t *registry, juice_cb_mux_incoming_t cb, void 
 		return -1;
 	}
 
-	if (registry_impl->cb_mux_incoming) {
+	if (registry_impl->cb_mux_incoming || registry_impl->pending_required) {
 		JLOG_VERBOSE("conn_mux_listen Callback already registered\n");
 		return -1;
 	}
@@ -699,5 +975,128 @@ bool conn_mux_can_release_registry(conn_registry_t *registry) {
 		return true;
 	}
 
-	return registry_impl->cb_mux_incoming == NULL;
+	return registry_impl->cb_mux_incoming == NULL && registry_impl->cb_mux_pending == NULL &&
+	       !registry_impl->pending_closing;
+}
+
+int conn_mux_listen_pending(conn_registry_t *registry, const juice_mux_pending_config_t *config,
+                           juice_cb_mux_pending_t cb, void *user_ptr) {
+	registry_impl_t *impl = registry->impl;
+	if (!cb || impl->cb_mux_incoming || impl->cb_mux_pending || impl->pending_closing)
+		return JUICE_ERR_NOT_AVAIL;
+	unsigned int limit = config && config->max_pending ? config->max_pending : 256;
+	unsigned int timeout = config && config->timeout_ms ? config->timeout_ms : 5000;
+	if (limit > 4096 || timeout > 30000) return JUICE_ERR_INVALID;
+	unsigned int buckets = 1;
+	while (buckets < limit * 2) buckets *= 2;
+	pending_request_t **table = calloc(buckets, sizeof(*table));
+	pending_request_t **ids = calloc(buckets, sizeof(*ids));
+	if (!table || !ids) { free(table); free(ids); return JUICE_ERR_FAILED; }
+	free(impl->pending_buckets);
+	free(impl->pending_ids);
+	impl->pending_buckets = table;
+	impl->pending_ids = ids;
+	impl->pending_bucket_count = buckets;
+	// Already-attached requests belong to their agents, even across listener stop.
+	for (pending_request_t *request = impl->pending_head; request; request = request->next) {
+		unsigned long bucket = pending_hash(&request->src, request->local_ufrag,
+		                                   request->remote_ufrag) % buckets;
+		request->hash_next = table[bucket];
+		table[bucket] = request;
+		request->id_next = ids[request->id % buckets];
+		ids[request->id % buckets] = request;
+	}
+	impl->max_pending = limit;
+	impl->pending_timeout_ms = timeout;
+	impl->pending_required = true;
+	impl->cb_mux_pending = cb;
+	impl->mux_pending_user_ptr = user_ptr;
+	return 0;
+}
+
+int conn_mux_begin_stop_pending(conn_registry_t *registry) {
+	registry_impl_t *impl = registry->impl;
+#ifdef _WIN32
+	if (GetCurrentThreadId() == GetThreadId(impl->thread)) return JUICE_ERR_INVALID;
+#else
+	if (pthread_equal(pthread_self(), impl->thread)) return JUICE_ERR_INVALID;
+#endif
+	if (!impl->cb_mux_pending || impl->pending_closing) return JUICE_ERR_NOT_AVAIL;
+	impl->pending_closing = true; // Keeps the registry alive until callback completion.
+	impl->cb_mux_pending = NULL;
+	impl->mux_pending_user_ptr = NULL;
+	pending_request_t *request = impl->pending_head;
+	while (request) {
+		pending_request_t *next = request->next;
+		if (!request->agent) remove_pending(impl, request);
+		request = next;
+	}
+	return 0;
+}
+
+void conn_mux_wait_pending_callbacks(conn_registry_t *registry) {
+	registry_impl_t *impl = registry->impl;
+	mutex_lock(&impl->callback_mutex);
+	mutex_unlock(&impl->callback_mutex);
+}
+
+void conn_mux_finish_stop_pending(conn_registry_t *registry) {
+	registry_impl_t *impl = registry->impl;
+	impl->pending_closing = false;
+	conn_mux_interrupt_registry(registry);
+}
+
+int conn_mux_verify_request(conn_registry_t *registry, uint64_t id, const char *password) {
+	registry_impl_t *impl = registry->impl;
+	expire_pending(impl, current_timestamp());
+	pending_request_t *request = pending_by_id(impl, id);
+	if (!request || request->verified || !request->notified) return JUICE_ERR_NOT_AVAIL;
+	map_entry_t *entry = find_map_entry(impl, &request->src, false);
+	stun_message_t message;
+	if ((entry && entry->type == MAP_ENTRY_TYPE_FULL) ||
+	    stun_read(request->data, request->size, &message) < 0 ||
+	    !stun_check_integrity(request->data, request->size, &message, password)) {
+		++impl->rejected;
+		remove_pending(impl, request);
+		return JUICE_ERR_FAILED;
+	}
+	strcpy(request->password, password);
+	request->verified = true;
+	return 0;
+}
+
+int conn_mux_attach_request(conn_registry_t *registry, uint64_t id, juice_agent_t *agent) {
+	registry_impl_t *impl = registry->impl;
+	expire_pending(impl, current_timestamp());
+	pending_request_t *request = pending_by_id(impl, id);
+	if (!request || !request->verified || request->agent) return JUICE_ERR_NOT_AVAIL;
+	if (agent->registry != registry || !is_ready(agent) ||
+	    strcmp(agent->local.ice_ufrag, request->local_ufrag) != 0 ||
+	    strcmp(agent->remote.ice_ufrag, request->remote_ufrag) != 0 ||
+	    strcmp(agent->local.ice_pwd, request->password) != 0) return JUICE_ERR_INVALID;
+	map_entry_t *entry = find_map_entry(impl, &request->src, false);
+	if (entry && entry->type == MAP_ENTRY_TYPE_FULL) return JUICE_ERR_NOT_AVAIL;
+	for (pending_request_t *other = impl->ready_head; other; other = other->work_next)
+		if (addr_record_is_equal(&request->src, &other->src, true))
+			return JUICE_ERR_NOT_AVAIL;
+	if (conn_mux_interrupt_registry(registry) != 0) return JUICE_ERR_FAILED;
+	remove_expiry(impl, request);
+	request->agent = agent;
+	append_work(&impl->ready_head, &impl->ready_tail, request);
+	return 0;
+}
+
+int conn_mux_reject_request(conn_registry_t *registry, uint64_t id) {
+	registry_impl_t *impl = registry->impl;
+	pending_request_t *request = pending_by_id(impl, id);
+	if (!request || request->agent) return JUICE_ERR_NOT_AVAIL;
+	++impl->rejected;
+	remove_pending(impl, request);
+	return 0;
+}
+
+void conn_mux_get_stats(conn_registry_t *registry, juice_mux_stats_t *stats) {
+	registry_impl_t *impl = registry->impl;
+	*stats = (juice_mux_stats_t){impl->received, impl->rejected, registry->agents_count,
+		impl->map_count, impl->pending_count, impl->notifications, impl->duplicates};
 }

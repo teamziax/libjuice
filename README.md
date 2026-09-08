@@ -103,6 +103,9 @@ See [test/connectivity.c](https://github.com/paullouisageneau/libjuice/blob/mast
 
 See [test/server.c](https://github.com/paullouisageneau/libjuice/blob/master/test/server.c) for a server example.
 
+For a shared UDP endpoint that accepts connections asynchronously, see
+[pending connections](docs/pending-connections.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/paullouisageneau/libjuice/blob/master/CONTRIBUTING.md) for contribution guidelines.
