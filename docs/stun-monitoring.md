@@ -63,24 +63,3 @@ branches against minimal SDK shims. They cover 64-bit Windows uptime and legacy 
 timebase conversion, including long uptime. They do not replace Windows/macOS build
 and runtime CI. Monotonic clocks on some systems exclude suspended time; applications
 must requalify observations after system suspend/resume.
-
-## External kernel lab executable
-
-The same build produces `stun-monitor-probe`, with bounded server and monitor modes:
-
-```sh
-build/stun-monitor-probe server --bind-address 198.18.77.10 --local-port 3478 --duration-ms 90000
-build/stun-monitor-probe monitor --bind-address 10.77.0.2 --local-port 39000 \
-  --stun-server 198.18.77.10 --stun-port 3478 --duration-ms 75000
-```
-
-Run each command in its assigned external lab namespace. All addresses must be numeric
-and the monitor's bind/server address families must match. Durations are required and
-bounded to one hour. The server is libjuice's real STUN responder: its XOR-MAPPED-ADDRESS
-comes from the received UDP source. No mapping address is supplied by this executable.
-The monitor owns a listener plus a dedicated no-peer agent on the same fixed UDP mux.
-It emits newline JSON readiness, one-second observation snapshots and final socket
-release, and fails if any peer admission state appears. No game packets are exchanged.
-External lab tooling owns topology, translation/filter changes, process isolation and
-validation of observations. Exit success means the bounded process and socket lifecycle
-completed; a missing STUN response is represented in snapshots and is not a pass verdict.
