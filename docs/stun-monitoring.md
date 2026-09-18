@@ -55,6 +55,6 @@ cmake --build build -j 4
 ./build/tests # Windows: build\tests.exe
 ```
 
-The existing test runner calls `test_stun_monitoring()` on Linux, macOS and Windows; `NO_TESTS=ON` disables the normal test build. Its five independent scenarios run concurrently using the library's thread helpers.
+The existing test runner calls `test_stun_monitoring()` on Linux, macOS and Windows; `NO_TESTS=ON` disables the normal test build.
 
-The monitoring tests use real IPv4/IPv6 loopback UDP sockets and production timers. Fixture STUN responses exercise address/port changes, unchanged refreshes, loss and ageing, source/transaction validation, initial-timeout and server-error recovery, opt-in behavior, shared-socket ICE data, and independent teardown. No external STUN service or NAT emulator is used. These tests do not establish public-network NAT traversal, DTLS/SCTP compatibility, or game-client behavior.
+The monitoring tests use real IPv4/IPv6 loopback UDP sockets and fixture STUN responses. They cover initial observations, source/transaction validation, duplicate rejection, server errors with monitoring enabled and disabled, shared-socket ICE data, and independent teardown. They do not wait for periodic refresh, retry or consent expiry, so those timer-driven transitions are outside this test's coverage. No external STUN service or NAT emulator is used. These tests do not establish public-network NAT traversal, DTLS/SCTP compatibility, or game-client behavior.
