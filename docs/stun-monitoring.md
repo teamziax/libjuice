@@ -57,9 +57,3 @@ ctest --test-dir build --output-on-failure -j 5
 ```
 
 The monitoring tests use real IPv4/IPv6 loopback UDP sockets and production timers. Fixture STUN responses exercise address/port changes, unchanged refreshes, loss and ageing, source/transaction validation, initial-timeout and server-error recovery, opt-in behavior, shared-socket ICE data, and independent teardown. No external STUN service or NAT emulator is used. These tests do not establish public-network NAT traversal, DTLS/SCTP compatibility, or game-client behavior.
-
-`timestamp-windows-shim` and `timestamp-macos-shim` compile the actual platform clock
-branches against minimal SDK shims. They cover 64-bit Windows uptime and legacy Mach
-timebase conversion, including long uptime. They do not replace Windows/macOS build
-and runtime CI. Monotonic clocks on some systems exclude suspended time; applications
-must requalify observations after system suspend/resume.
