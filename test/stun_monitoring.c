@@ -1,29 +1,49 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 #include <juice/juice.h>
 #include "stun.h"
+#include "thread.h"
 
-#include <arpa/inet.h>
+// Keep test operations inside assertions active in Release builds too.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
-#include <poll.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
-#include <unistd.h>
+
+static mutex_t received_mutex = MUTEX_INITIALIZER;
+
+static void sleep_ms(unsigned int ms) {
+#ifdef _WIN32
+	Sleep(ms);
+#else
+	usleep(ms * 1000);
+#endif
+}
+
+static uint16_t socket_port(const struct sockaddr *address) {
+	return address->sa_family == AF_INET
+	           ? ntohs(((const struct sockaddr_in *)address)->sin_port)
+	           : ntohs(((const struct sockaddr_in6 *)address)->sin6_port);
+}
 
 // Real loopback UDP and production STUN timers; the returned mappings are fixtures,
 // not a NAT emulator or a claim about public reachability.
 static uint64_t now_ms(void) {
+#ifdef _WIN32
+	return GetTickCount64();
+#else
 	struct timespec now;
 	assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
 	return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+#endif
 }
 
-static int bound_socket(int family, uint16_t *port) {
-	int fd = socket(family, SOCK_DGRAM, 0);
-	assert(fd >= 0);
+static socket_t bound_socket(int family, uint16_t *port) {
+	socket_t fd = socket(family, SOCK_DGRAM, 0);
+	assert(fd != INVALID_SOCKET);
 	struct sockaddr_storage storage = {0};
 	socklen_t len;
 	if (family == AF_INET) {
@@ -39,19 +59,19 @@ static int bound_socket(int family, uint16_t *port) {
 	}
 	assert(bind(fd, (struct sockaddr *)&storage, len) == 0);
 	assert(getsockname(fd, (struct sockaddr *)&storage, &len) == 0);
-	*port = addr_get_port((struct sockaddr *)&storage);
+	*port = socket_port((struct sockaddr *)&storage);
 	return fd;
 }
 
-static stun_message_t request(int fd, addr_record_t *source, uint16_t mux_port, int timeout_ms) {
+static stun_message_t request(socket_t fd, addr_record_t *source, uint16_t mux_port, int timeout_ms) {
 	struct pollfd pfd = {.fd = fd, .events = POLLIN};
 	assert(poll(&pfd, 1, timeout_ms) == 1);
 	unsigned char data[2048];
 	source->len = sizeof(source->addr);
-	ssize_t size = recvfrom(fd, data, sizeof(data), 0, (struct sockaddr *)&source->addr, &source->len);
+	int size = (int)recvfrom(fd, (char *)data, (int)sizeof(data), 0, (struct sockaddr *)&source->addr, &source->len);
 	assert(size > 0);
 	source->socktype = SOCK_DGRAM;
-	assert(addr_get_port((struct sockaddr *)&source->addr) == mux_port);
+	assert(socket_port((struct sockaddr *)&source->addr) == mux_port);
 	stun_message_t message = {0};
 	assert(_juice_stun_read(data, (size_t)size, &message) > 0);
 	assert(message.msg_class == STUN_CLASS_REQUEST && message.msg_method == STUN_METHOD_BINDING);
@@ -59,7 +79,7 @@ static stun_message_t request(int fd, addr_record_t *source, uint16_t mux_port, 
 	return message;
 }
 
-static void respond(int fd, const addr_record_t *source, const stun_message_t *request,
+static void respond(socket_t fd, const addr_record_t *source, const stun_message_t *request,
                     int family, uint16_t mapped_port, unsigned int error) {
 	stun_message_t response = {0};
 	response.msg_class = error ? STUN_CLASS_RESP_ERROR : STUN_CLASS_RESP_SUCCESS;
@@ -89,7 +109,7 @@ static void respond(int fd, const addr_record_t *source, const stun_message_t *r
 	unsigned char data[2048];
 	int size = _juice_stun_write(data, sizeof(data), &response, NULL);
 	assert(size > 0);
-	assert(sendto(fd, data, (size_t)size, 0, (const struct sockaddr *)&source->addr, source->len) == size);
+	assert(sendto(fd, (const char *)data, size, 0, (const struct sockaddr *)&source->addr, source->len) == size);
 }
 
 static juice_stun_binding_t snapshot(juice_agent_t *agent) {
@@ -101,7 +121,7 @@ static juice_stun_binding_t snapshot(juice_agent_t *agent) {
 static juice_stun_binding_t successes(juice_agent_t *agent, uint64_t count) {
 	juice_stun_binding_t binding = snapshot(agent);
 	for (int i = 0; i < 400 && binding.successful_responses < count; ++i) {
-		usleep(5000);
+		sleep_ms(5);
 		binding = snapshot(agent);
 	}
 	assert(binding.successful_responses == count);
@@ -119,32 +139,37 @@ static void unexpected_peer(const juice_mux_pending_request_t *request, void *pt
 static void received(juice_agent_t *agent, const char *data, size_t size, void *ptr) {
 	(void)agent;
 	assert(size == 4 && memcmp(data, "data", 4) == 0);
-	atomic_fetch_add((atomic_uint *)ptr, 1);
+	mutex_lock(&received_mutex);
+	++*(unsigned int *)ptr;
+	mutex_unlock(&received_mutex);
 }
 
 static void round_trip(juice_agent_t *first, juice_agent_t *second,
-                       atomic_uint *first_received, atomic_uint *second_received, unsigned int count) {
+                       unsigned int *first_received, unsigned int *second_received, unsigned int count) {
 	assert(juice_send(first, "data", 4) == 0 && juice_send(second, "data", 4) == 0);
 	for (int i = 0; i < 400; ++i) {
-		if (atomic_load(first_received) == count && atomic_load(second_received) == count) return;
-		usleep(5000);
+		mutex_lock(&received_mutex);
+		bool complete = *first_received == count && *second_received == count;
+		mutex_unlock(&received_mutex);
+		if (complete) return;
+		sleep_ms(5);
 	}
 	assert(!"ICE data did not traverse both directions");
 }
 
 static void shared_dual_stack(void) {
 	uint16_t port4, port6, mux_port, peer_port;
-	int server4 = bound_socket(AF_INET, &port4), server6 = bound_socket(AF_INET6, &port6);
-	int reserved = bound_socket(AF_INET6, &mux_port);
-	close(reserved);
+	socket_t server4 = bound_socket(AF_INET, &port4), server6 = bound_socket(AF_INET6, &port6);
+	socket_t reserved = bound_socket(AF_INET6, &mux_port);
+	closesocket(reserved);
 	reserved = bound_socket(AF_INET, &peer_port);
-	close(reserved);
+	closesocket(reserved);
 	juice_config_t config = {0};
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_MUX;
 	config.local_port_range_begin = config.local_port_range_end = mux_port;
 	config.stun_server_host = "127.0.0.1";
 	config.stun_server_port = port4;
-	atomic_uint count4 = 0, count_peer = 0;
+	unsigned int count4 = 0, count_peer = 0;
 	config.cb_recv = received;
 	config.user_ptr = &count4;
 	juice_agent_t *monitor4 = juice_create(&config);
@@ -187,7 +212,7 @@ static void shared_dual_stack(void) {
 	         password, mux_port);
 	assert(juice_set_remote_description(peer, description) == 0);
 	for (int i = 0; i < 1000 && (juice_get_state(monitor4) != JUICE_STATE_COMPLETED ||
-	                            juice_get_state(peer) != JUICE_STATE_COMPLETED); ++i) usleep(5000);
+	                            juice_get_state(peer) != JUICE_STATE_COMPLETED); ++i) sleep_ms(5);
 	assert(juice_get_state(monitor4) == JUICE_STATE_COMPLETED && juice_get_state(peer) == JUICE_STATE_COMPLETED);
 	round_trip(monitor4, peer, &count4, &count_peer, 1);
 	// Nomination must not disable opted-in discovery. Both families share this
@@ -215,28 +240,25 @@ static void shared_dual_stack(void) {
 	juice_destroy(monitor4);
 	juice_mux_stats_t stats;
 	assert(juice_mux_get_stats(NULL, mux_port, &stats) == JUICE_ERR_NOT_AVAIL);
-	close(server4);
-	close(server6);
+	closesocket(server4);
+	closesocket(server6);
 	puts("STUN monitoring shared: dual-stack socket, nominated ICE data, independent observations and teardown PASS");
 }
 
-int main(int argc, char **argv) {
-	assert(argc == 2);
-	juice_set_log_level(JUICE_LOG_LEVEL_FATAL);
-	if (strcmp(argv[1], "shared") == 0) {
+static void run_scenario(const char *scenario) {
+	if (strcmp(scenario, "shared") == 0) {
 		shared_dual_stack();
-		return 0;
+		return;
 	}
-	bool initial_timeout = strcmp(argv[1], "timeout") == 0;
-	bool disabled = strcmp(argv[1], "disabled") == 0;
-	int family = strcmp(argv[1], "6") == 0 ? AF_INET6 : AF_INET;
+	bool initial_timeout = strcmp(scenario, "timeout") == 0;
+	bool disabled = strcmp(scenario, "disabled") == 0;
+	int family = strcmp(scenario, "6") == 0 ? AF_INET6 : AF_INET;
 	const char *host = family == AF_INET ? "127.0.0.1" : "::1";
-	juice_set_log_level(JUICE_LOG_LEVEL_FATAL);
 	uint16_t server_port, mux_port, wrong_port;
-	int server = bound_socket(family, &server_port);
-	int wrong_server = bound_socket(family, &wrong_port);
-	int reserved = bound_socket(family, &mux_port);
-	close(reserved);
+	socket_t server = bound_socket(family, &server_port);
+	socket_t wrong_server = bound_socket(family, &wrong_port);
+	socket_t reserved = bound_socket(family, &mux_port);
+	closesocket(reserved);
 	assert(juice_mux_listen_pending(host, mux_port, NULL, unexpected_peer, NULL) == 0);
 	juice_config_t config = {0};
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_MUX;
@@ -262,7 +284,7 @@ int main(int argc, char **argv) {
 	stun_message_t message = request(server, &source, mux_port, 2000);
 	if (disabled) {
 		respond(server, &source, &message, family, 0, 500);
-		for (int i = 0; i < 400 && snapshot(agent).failed_transactions == 0; ++i) usleep(5000);
+		for (int i = 0; i < 400 && snapshot(agent).failed_transactions == 0; ++i) sleep_ms(5);
 		assert(snapshot(agent).state == JUICE_STUN_BINDING_FAILED);
 		struct pollfd pfd = {.fd = server, .events = POLLIN};
 		assert(poll(&pfd, 1, 16000) == 0); // legacy failure does not opt into retry
@@ -271,7 +293,7 @@ int main(int argc, char **argv) {
 		uint8_t original[STUN_TRANSACTION_ID_SIZE];
 		memcpy(original, message.transaction_id, sizeof(original));
 		uint64_t deadline = now_ms() + 28000;
-		while (snapshot(agent).failed_transactions == 0 && now_ms() < deadline) usleep(5000);
+		while (snapshot(agent).failed_transactions == 0 && now_ms() < deadline) sleep_ms(5);
 		binding = snapshot(agent);
 		assert(binding.state == JUICE_STUN_BINDING_FAILED && binding.failed_transactions == 1);
 		assert(binding.successful_responses == 0 && binding.last_success_age_ms == UINT64_MAX);
@@ -289,14 +311,14 @@ int main(int argc, char **argv) {
 		stun_message_t unknown = message;
 		unknown.transaction_id[0] ^= 1;
 		respond(server, &source, &unknown, family, 40000, 0);
-		usleep(100000);
+		sleep_ms(100);
 		assert(snapshot(agent).successful_responses == 0);
 		respond(server, &source, &message, family, 40000, 0);
 		binding = successes(agent, 1);
 		assert(binding.mapping_revision == 1 && binding.mapped_port == 40000);
 		assert(strcmp(binding.mapped_address, family == AF_INET ? "198.51.100.10" : "2001:db8::10") == 0);
 		respond(server, &source, &message, family, 49999, 0);
-		usleep(100000);
+		sleep_ms(100);
 		binding = snapshot(agent);
 		assert(binding.successful_responses == 1 && binding.mapping_revision == 1);
 		assert(binding.mapped_port == 40000 && binding.last_success_age_ms >= 90);
@@ -322,7 +344,7 @@ int main(int argc, char **argv) {
 		// A caller's freshness limit can expire while the socket remains warm.
 		assert(binding.last_success_age_ms > 20000);
 		respond(server, &source, &message, family, 0, 500);
-		for (int i = 0; i < 400 && snapshot(agent).failed_transactions < 2; ++i) usleep(5000);
+		for (int i = 0; i < 400 && snapshot(agent).failed_transactions < 2; ++i) sleep_ms(5);
 		binding = snapshot(agent);
 		assert(binding.state == JUICE_STUN_BINDING_FAILED && binding.failed_transactions == 2);
 		assert(binding.last_success_age_ms >= 29000 && binding.mapping_revision == 2);
@@ -340,8 +362,37 @@ int main(int argc, char **argv) {
 	assert(juice_mux_get_stats(host, mux_port, &stats) == 0 && stats.agents == 0);
 	assert(juice_mux_listen_pending(host, mux_port, NULL, NULL, NULL) == 0);
 	assert(juice_mux_get_stats(host, mux_port, &stats) == JUICE_ERR_NOT_AVAIL);
-	close(server);
-	close(wrong_server);
-	printf("STUN monitoring %s: actual shared mux, zero peers, observations and teardown PASS\n", argv[1]);
+	closesocket(server);
+	closesocket(wrong_server);
+	printf("STUN monitoring %s: actual shared mux, zero peers, observations and teardown PASS\n", scenario);
+}
+
+static thread_return_t THREAD_CALL scenario_thread(void *arg) {
+	run_scenario(arg);
 	return 0;
+}
+
+int test_stun_monitoring(void) {
+#ifdef _WIN32
+	WSADATA data;
+	if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+		return -1;
+#endif
+	juice_set_log_level(JUICE_LOG_LEVEL_FATAL);
+	// Independent sockets let the real keepalive/timeout scenarios run concurrently.
+	const char *scenarios[] = {"4", "6", "timeout", "shared", "disabled"};
+	thread_t threads[5];
+	int started = 0;
+	for (; started < 5; ++started) {
+		if (thread_init(&threads[started], scenario_thread, (void *)scenarios[started]) != 0)
+			break;
+	}
+	for (int i = 0; i < started; ++i)
+		thread_join(threads[i], NULL);
+	mutex_destroy(&received_mutex);
+	juice_set_log_level(JUICE_LOG_LEVEL_WARN);
+#ifdef _WIN32
+	WSACleanup();
+#endif
+	return started == 5 ? 0 : -1;
 }

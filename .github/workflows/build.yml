@@ -26,7 +26,7 @@ jobs:
     - name: make
       run: (cd build; make)
     - name: test
-      run: ctest --test-dir build --output-on-failure --parallel 5
+      run: ./build/tests
   build-macos:
     runs-on: macos-latest
     steps:

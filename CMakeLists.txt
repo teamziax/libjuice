@@ -74,6 +74,7 @@ set(TESTS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/stun-unhandled-no-host.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/stun-unhandled-unhandle.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/stun.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/stun_monitoring.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/gathering.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/connectivity.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/turn.c
@@ -231,7 +232,6 @@ endif()
 
 # Tests
 if(NOT NO_TESTS)
-	enable_testing()
 	add_executable(juice-tests ${TESTS_SOURCES})
 	target_include_directories(juice-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 	target_include_directories(juice-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/juice)
@@ -244,18 +244,6 @@ if(NOT NO_TESTS)
 		XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.github.paullouisageneau.libjuice.tests)
 
 	target_link_libraries(juice-tests juice Threads::Threads)
-	add_test(NAME juice-tests COMMAND juice-tests)
-
-	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-		add_executable(stun-monitoring-test test/stun_monitoring.c)
-		target_include_directories(stun-monitoring-test PRIVATE src include/juice)
-		target_link_libraries(stun-monitoring-test PRIVATE juice-static Threads::Threads)
-		target_compile_options(stun-monitoring-test PRIVATE -UNDEBUG)
-		foreach(scenario IN ITEMS 4 6 timeout shared disabled)
-			add_test(NAME stun-monitoring-${scenario} COMMAND stun-monitoring-test ${scenario})
-			set_tests_properties(stun-monitoring-${scenario} PROPERTIES TIMEOUT 100)
-		endforeach()
-	endif()
 
 	if(WIN32)
 		target_link_libraries(juice-tests ws2_32)

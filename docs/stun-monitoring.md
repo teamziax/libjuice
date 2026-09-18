@@ -52,9 +52,9 @@ The existing resolver is unchanged: it captures at most two STUN-server results 
 ```sh
 cmake -S . -B build -DWARNINGS_AS_ERRORS=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j 4
-ctest --test-dir build --output-on-failure -j 5
+./build/tests # Windows: build\tests.exe
 ```
 
-On Linux, the normal test build includes the monitoring cases; `NO_TESTS=ON` disables them. CTest runs the existing `juice-tests` runner and the monitoring cases, which can run concurrently.
+The existing test runner calls `test_stun_monitoring()` on Linux, macOS and Windows; `NO_TESTS=ON` disables the normal test build. Its five independent scenarios run concurrently using the library's thread helpers.
 
 The monitoring tests use real IPv4/IPv6 loopback UDP sockets and production timers. Fixture STUN responses exercise address/port changes, unchanged refreshes, loss and ageing, source/transaction validation, initial-timeout and server-error recovery, opt-in behavior, shared-socket ICE data, and independent teardown. No external STUN service or NAT emulator is used. These tests do not establish public-network NAT traversal, DTLS/SCTP compatibility, or game-client behavior.
