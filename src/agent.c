@@ -1201,6 +1201,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 		JLOG_WARN("Lost connectivity");
 		agent_change_state(agent, JUICE_STATE_FAILED);
 		atomic_store(&agent->selected_entry, NULL); // disallow sending
+		// Keep STUN monitoring scheduled even though the ICE session has failed.
 		if (agent->stun_monitoring)
 			goto schedule_entries;
 		return 0;
@@ -1303,6 +1304,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			JLOG_INFO("Connectivity timer expired");
 			agent_change_state(agent, JUICE_STATE_FAILED);
 			atomic_store(&agent->selected_entry, NULL); // disallow sending
+			// Keep STUN monitoring scheduled even though the ICE session has failed.
 			if (agent->stun_monitoring)
 				goto schedule_entries;
 			return 0;
